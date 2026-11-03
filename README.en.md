@@ -131,7 +131,8 @@ internal/server/    HTTP + WebSocket + layout storage
 ui/                 frontend (xterm 5.5.0, embedded into the binary)
 package/            fnOS package source tree
 tools/              build, package, deploy and test scripts
-docs/               troubleshooting and design notes
+DESIGN.md           architecture notes
+docs/               troubleshooting and implementation notes
 ```
 
 ## Troubleshooting

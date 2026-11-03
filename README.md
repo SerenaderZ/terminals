@@ -133,7 +133,8 @@ internal/server/    HTTP + WebSocket + 布局存储
 ui/                 前端（xterm 5.5.0，资源内嵌进二进制）
 package/            fnOS 安装包源目录
 tools/              构建、打包、部署、测试脚本
-docs/               故障排查与设计文档
+DESIGN.md           架构设计
+docs/               故障排查与实现笔记
 ```
 
 ## 故障排查
