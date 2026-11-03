@@ -3,7 +3,7 @@ package session
 import "runtime"
 
 // Version 是协议与实现版本，会随 READY 帧发给前端。
-const Version = "0.2.14"
+const Version = "0.2.15"
 
 // Config 是会话管理器的配置。
 type Config struct {

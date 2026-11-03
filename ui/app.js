@@ -684,15 +684,26 @@
   // 为什么必须重画：TUI 退出时是一串"恢复主屏 + 恢复光标"的转义序列，
   // 渲染器如果只按脏区增量更新，就会把 TUI 的残留格子留在屏幕上 ——
   // 用户看到的就是"退出后一堆乱码"。整屏重画是最便宜且确定有效的解法。
+  //
+  // 为什么刷两次：切换缓冲区这一刻，程序往往还会紧接着打印收尾信息
+  // （claude 退出时的 "Resume this session with…" 就是），这些字节是在
+  // 第一次 refresh 之后才落屏的。只刷一次，它们依旧按增量绘制，上一屏
+  // 留下的脏格子就跟着一起留在画面上。第二次补刷把它们一并盖掉。
   Session.prototype.afterBufferSwap = function () {
     var self = this;
+    var paint = function () {
+      if (!self.term) return;
+      try { self.term.refresh(0, self.term.rows - 1); } catch (e) { }
+    };
     requestAnimationFrame(function () {
       if (!self.term) return;
       if (self.webgl && typeof self.webgl.clearTextureAtlas === 'function') {
         try { self.webgl.clearTextureAtlas(); } catch (e) { }
       }
-      try { self.term.refresh(0, self.term.rows - 1); } catch (e) { }
+      paint();
     });
+    clearTimeout(this.swapTimer);
+    this.swapTimer = setTimeout(paint, 80);
   };
 
   // clearScreen 清屏并清掉 scrollback。TUI 异常退出（比如被 kill）时不会自己
@@ -957,10 +968,24 @@
         var info;
         try { info = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { return; }
 
-        if (self.sid && info.sid !== self.sid && self.term) {
+        var becameNewSession = self.sid && info.sid !== self.sid;
+
+        // 回放马上就到，先把屏幕清干净。
+        //
+        // 不清的话，同一个窗格重连时上一次连接留下的画面还在，回放又从
+        // 会话最开始重新灌一遍，两份内容就叠在一起 —— 重影、错行、半截
+        // 控制序列，全从这儿来。TUI 退出后"满屏乱码"也是同一个成因：
+        // 屏幕上还挂着备用屏幕那一帧。
+        //
+        // 换成另一个会话时同理，而且必须更彻底：连 scrollback 一起丢掉，
+        // 免得两个会话的历史混在一条回看缓冲里。
+        if (self.term && (info.replayLen > 0 || becameNewSession)) {
           self.term.reset();
-          self.exited = false;
+          self.selSnap = null;
+          self.alt = false;
+          self.opts.onAlt && self.opts.onAlt(false);
         }
+        if (becameNewSession) self.exited = false;
         self.sid = info.sid;
 
         // 尺寸对账：READY 里的 cols/rows 是 PTY 当前的真实大小。
@@ -1024,7 +1049,11 @@
       if (self.disposed) return;
       self.fail(closeReason(ev), ev && ev.code);
       self.setState('offline');
-      if (!self.exited) self.scheduleRetry();
+      // 1013 = 服务端主动放弃这条连接（输出太快，队列跟不上）。
+      // 这不是故障，是"重连一下就好"：清掉退避计数，别让用户对着
+      // 一个已经过去的问题等 1s、2s、4s。
+      if (ev && ev.code === 1013) self.retry = 0;
+      if (!self.exited) self.scheduleRetry(ev && ev.code === 1013);
     };
   };
 
@@ -1059,10 +1088,13 @@
     return true;
   };
 
-  Session.prototype.scheduleRetry = function () {
+  Session.prototype.scheduleRetry = function (immediate) {
     var self = this;
     if (this.disposed || this.retryTimer) return;
-    var delay = Math.min(8000, 500 * Math.pow(2, this.retry));
+    // immediate 只用于服务端明确说"重连就好"的场景（1013 输出跟不上）。
+    // 但只给前两次开绿灯：真要是服务挂了，快速重试会变成打自己的服务器。
+    var fast = immediate && this.retry < 2;
+    var delay = fast ? 50 : Math.min(8000, 500 * Math.pow(2, this.retry));
     this.retry += 1;
     this.retryAt = Date.now() + delay;
     this.retryTimer = setTimeout(function () {

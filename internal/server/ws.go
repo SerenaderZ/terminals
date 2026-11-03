@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"terminals/internal/proto"
+	"terminals/internal/session"
 )
 
 // 心跳间隔必须小于网关的 proxy_read_timeout（飞牛是 300s），
@@ -169,18 +170,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, replay, inAlt, needAltEnter := sess.Attach()
+	client, replay, inAlt, needAltEnter, truncated := sess.Attach()
 	defer sess.Detach(client)
 
 	// READY 必须在回放之前发：前端要先知道 sid 和是否在备用屏幕。
-	readyJSON, _ := json.Marshal(sess.Ready(inAlt, needAltEnter))
+	// replayLen 一起带上，前端据此在灌回放之前把屏幕清干净 —— 不清的话
+	// 重连后旧画面会和新回放叠成一团重影。
+	readyJSON, _ := json.Marshal(sess.Ready(inAlt, needAltEnter, len(replay), truncated))
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindReady, readyJSON)); err != nil {
 		return
 	}
-	if len(replay) > 0 {
+	if out := session.PrepareReplay(replay, truncated); len(out) > 0 {
 		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindOutput, replay)); err != nil {
+		if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindOutput, out)); err != nil {
 			return
 		}
 	}
@@ -229,6 +232,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case <-client.Done():
+				// 队列满导致的关闭：这条连接已经跟不上 PTY 的输出了。
+				//
+				// 不能"把剩下的慢慢写完"——塞在队列里的 256 帧只是最近的一小段，
+				// 真正的完整内容在会话的回放缓冲里。用 1013 明确告诉前端
+				// "立刻重连"，前端连上后回放会把整屏重建，比在这儿硬撑更干净。
+				// 硬撑的后果是前端要等这几百帧慢慢发完，这期间 PTY 还在写，
+				// 队列只会更满。
+				if client.Overflowed() {
+					_ = conn.WriteControl(websocket.CloseMessage,
+						websocket.FormatCloseMessage(1013, "输出太快，连接跟不上，正在重连"),
+						time.Now().Add(time.Second))
+					conn.Close()
+					return
+				}
 				// 会话结束：把收尾的退出帧刷出去，再关连接解除读阻塞。
 				time.Sleep(100 * time.Millisecond)
 				conn.Close()

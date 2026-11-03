@@ -40,6 +40,15 @@ type Ready struct {
 	AltScreen    bool   `json:"altScreen"`
 	NeedAltEnter bool   `json:"needAltEnter"`
 	Version      string `json:"version"`
+
+	// ReplayLen 是紧随 READY 之后那一帧回放的字节数（0 表示没有回放）。
+	// 前端据此判断"要不要先把屏幕清空" —— 不清空就直接灌，重连后旧画面
+	// 会和新回放叠在一起，看起来就是一堆重影和错位字符。
+	ReplayLen int `json:"replayLen"`
+
+	// ReplayTruncated 表示回放的开头被环形缓冲覆盖掉了，起点落在半截
+	// 序列上。前端收到 true 时必须整屏重建，不能试图接着旧内容往下写。
+	ReplayTruncated bool `json:"replayTruncated"`
 }
 
 // Info 是会话列表里的一项。
@@ -65,9 +74,19 @@ type Client struct {
 	ch   chan []byte
 	done chan struct{}
 	once sync.Once
+	// over 记录"队列满导致的关闭"。
+	//
+	// 队列满不能用丢帧来对付：终端输出是字节流，少一帧就少几个字节，
+	// 轻则画面错字，重则丢在 CSI 序列中间 —— 之后整段输出都会被终端当成
+	// 序列参数吞掉，屏幕永久错乱（典型的"退出全屏程序后一屏乱码"）。
+	// 所以这里唯一的正确动作是：断开这条连接，让前端重连后靠回放重建。
+	over atomic.Bool
 }
 
-// Send 非阻塞投递一帧。返回 false 表示队列已满或连接已关。
+// Send 非阻塞投递一帧。返回 false 表示投递失败。
+//
+// 返回 false 有且只有两种原因：连接已关，或者待发队列满了。后者会顺手把
+// 连接标记成 overflowed —— 调用方据此断开，而不是继续往里塞。
 func (c *Client) Send(frame []byte) bool {
 	select {
 	case <-c.done:
@@ -78,9 +97,14 @@ func (c *Client) Send(frame []byte) bool {
 	case c.ch <- frame:
 		return true
 	default:
+		// 队列满：这是"客户端跟不上"，不是"这一帧可以不要"。
+		c.over.Store(true)
 		return false
 	}
 }
+
+// Overflowed 报告这条连接是否因为队列满被放弃。
+func (c *Client) Overflowed() bool { return c.over.Load() }
 
 // Close 关闭客户端。可重复调用。
 func (c *Client) Close() { c.once.Do(func() { close(c.done) }) }
@@ -118,6 +142,15 @@ type Session struct {
 	alt   altScanner
 
 	writeMu sync.Mutex
+
+	// resizeMu 把"改尺寸"串行化。
+	//
+	// Resize 来自 WebSocket 读循环，Nudge 来自建连后的补抖。两个 goroutine
+	// 各发各的 ioctl，交错顺序不受控：抖动那次的"恢复"可能先落地、浏览器的
+	// 真实尺寸后落地，也可能反过来 —— 最后 PTY 停在哪个值全看调度。
+	// 尺寸只要错一列，全屏程序（claude / htop）画的横线就短一截，
+	// 退出后留在主屏上就是错位的字符。
+	resizeMu sync.Mutex
 
 	// killOnce 让 Kill 幂等：关窗格、结束全部、退出清理可能都指向同一个会话，
 	// 重复对已经回收的 pid 发信号，运气不好会打到被复用的 pid 上。
@@ -257,9 +290,20 @@ func (s *Session) broadcast(chunk []byte) {
 	frame := proto.Frame(proto.KindOutput, chunk)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.clients {
-		c.Send(frame)
+	var drop []*Client
+	for id, c := range s.clients {
+		if !c.Send(frame) && c.Overflowed() {
+			// 跟不上就断开，绝不丢帧。丢一帧等于往字节流里挖个洞，
+			// 落在 CSI 序列中间时后面的输出会被整个吞掉。
+			// 断开之后前端重连，回放缓冲里有完整的内容。
+			delete(s.clients, id)
+			drop = append(drop, c)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, c := range drop {
+		c.Close()
 	}
 }
 
@@ -293,8 +337,12 @@ func (s *Session) finish(code int) {
 }
 
 // Attach 挂载一个客户端，返回客户端句柄和需要回放的输出。
-func (s *Session) Attach() (c *Client, replay []byte, inAlt, needAltEnter bool) {
+//
+// truncated 表示回放缓冲已经写满过、开头被覆盖 —— 前端拿到这种回放必须先
+// 把屏幕清干净再灌，否则旧画面会和回放叠在一起。
+func (s *Session) Attach() (c *Client, replay []byte, inAlt, needAltEnter, truncated bool) {
 	payload := s.ring.Snapshot()
+	truncated = s.ring.Truncated()
 
 	s.altMu.Lock()
 	inAlt = s.alt.InAlt()
@@ -311,7 +359,7 @@ func (s *Session) Attach() (c *Client, replay []byte, inAlt, needAltEnter bool) 
 	s.clients[c.ID] = c
 	s.mu.Unlock()
 
-	return c, payload, inAlt, needAltEnter
+	return c, payload, inAlt, needAltEnter, truncated
 }
 
 // Detach 解绑一个客户端。挂载守卫保证无论任务如何结束都会调用。
@@ -344,15 +392,24 @@ func (s *Session) Resize(cols, rows int) error {
 	if rows < 2 {
 		rows = 2
 	}
+
+	s.resizeMu.Lock()
+	defer s.resizeMu.Unlock()
+
 	atomic.StoreInt32(&s.cols, int32(cols))
 	atomic.StoreInt32(&s.rows, int32(rows))
 	return s.proc.Resize(cols, rows)
 }
 
-// Nudge 让 PTY 尺寸抖一下（少一列再回来），逼全屏程序整屏重画。
+// Nudge 让 PTY 尺寸抖一下，逼全屏程序整屏重画。
 //
 // 为什么需要：接回会话时回放的是"按旧尺寸画的"字节流，新窗口尺寸对不上就是
 // 一片花；而 TUI 只在收到 SIGWINCH 时才重绘，尺寸恰好没变的话它永远不重画。
+//
+// 为什么抖高度而不是宽度：抖动期间程序会按临时尺寸重排一次，万一"恢复"
+// 那一步没落到（连接刚好断、浏览器又发了新尺寸），宽度错一列就是永久的
+// —— claude 退出时那条横线会短一截、主屏错位。高度差一行只会多刷一次屏，
+// 视觉上无感，恢复失败也不影响横向排版。
 //
 // 为什么读当前尺寸、而不是接受调用方传参：抖动要花 80ms，这期间浏览器可能
 // 已经 fit 完、把最终行列数发过来了。拿调用瞬间的旧值恢复，会把新尺寸盖回去 ——
@@ -362,12 +419,16 @@ func (s *Session) Nudge() {
 	if s.proc == nil {
 		return
 	}
+
+	s.resizeMu.Lock()
+	defer s.resizeMu.Unlock()
+
 	cols := int(atomic.LoadInt32(&s.cols))
 	rows := int(atomic.LoadInt32(&s.rows))
-	if cols < 3 || rows < 2 {
+	if cols < 3 || rows < 4 {
 		return
 	}
-	_ = s.proc.Resize(cols-1, rows)
+	_ = s.proc.Resize(cols, rows-1)
 	time.Sleep(80 * time.Millisecond)
 	_ = s.proc.Resize(int(atomic.LoadInt32(&s.cols)), int(atomic.LoadInt32(&s.rows)))
 }
@@ -410,17 +471,19 @@ func (s *Session) ClientCount() int {
 }
 
 // Ready 组装发给前端的就绪信息。
-func (s *Session) Ready(inAlt, needAltEnter bool) Ready {
+func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated bool) Ready {
 	return Ready{
-		SID:          s.ID,
-		Shell:        s.Shell,
-		Cwd:          s.Cwd,
-		PID:          s.PID,
-		Cols:         int(atomic.LoadInt32(&s.cols)),
-		Rows:         int(atomic.LoadInt32(&s.rows)),
-		AltScreen:    inAlt,
-		NeedAltEnter: needAltEnter,
-		Version:      s.cfg.Version,
+		SID:             s.ID,
+		Shell:           s.Shell,
+		Cwd:             s.Cwd,
+		PID:             s.PID,
+		Cols:            int(atomic.LoadInt32(&s.cols)),
+		Rows:            int(atomic.LoadInt32(&s.rows)),
+		AltScreen:       inAlt,
+		NeedAltEnter:    needAltEnter,
+		Version:         s.cfg.Version,
+		ReplayLen:       replayLen,
+		ReplayTruncated: truncated,
 	}
 }
 
