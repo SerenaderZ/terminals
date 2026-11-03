@@ -1,0 +1,24 @@
+# 构建产物
+dist/
+*.exe
+.build/
+
+# 打包时从 dist 复制进去的二进制，不入库
+package/app/bin/tsd
+
+# 本地工具链（便携版 Go、npm 缓存、解包目录）
+.tools/
+
+# 测试脚本的依赖与产物（package.json 要入库，clone 后 npm install 才有的装）
+tools/node_modules/
+tools/ui-*.png
+tmp-layout.json
+tmp-data/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db

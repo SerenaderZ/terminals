@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TerminalS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c0c0c'/%3E%3Cpath d='M9 11l5 5-5 5' stroke='%234cc2ff' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M17.5 21h6' stroke='%23cccccc' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="titlebar">
+    <div id="tabstrip" role="tablist"></div>
+    <div id="spacer"></div>
+    <button id="status" type="button" aria-disabled="true" aria-live="polite">
+      <span id="led" class="led"></span>
+      <span id="statustext">未连接</span>
+      <span id="altscreen" class="badge" hidden>全屏</span>
+    </button>
+    <button id="btn-bg" class="icon-btn" title="后台会话（Shift + 点窗格上的 × 可以把窗格收到这里）">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 6h16"/>
+        <path d="M4 12h16"/>
+        <path d="M7 18h10"/>
+      </svg>
+      <span id="bg-count" hidden>0</span>
+    </button>
+    <button id="btn-settings" class="icon-btn" title="设置（Ctrl+Alt+,）">⚙</button>
+    <button id="btn-split-col" class="icon-btn" title="向下分屏（Ctrl+Alt+-）">▤</button>
+    <button id="btn-split-row" class="icon-btn" title="向右分屏（Ctrl+Alt+=）">▥</button>
+    <button id="btn-new" class="icon-btn" title="新建标签（Ctrl+Alt+T）">+</button>
+    <button id="btn-close-all" class="icon-btn" title="结束全部（关掉所有窗格，停掉里面跑的程序）">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+        <path d="M12 3.5v8"/>
+        <path d="M6.4 7.2a8 8 0 1 0 11.2 0"/>
+      </svg>
+    </button>
+  </header>
+
+  <main id="panes"></main>
+
+  <div id="banner" hidden></div>
+
+  <div id="settings" hidden>
+    <div id="set-box" role="dialog" aria-modal="true" aria-label="设置">
+      <header id="set-head">
+        <span>设置</span>
+        <button id="set-close" class="icon-btn" title="关闭（Esc）">✕</button>
+      </header>
+
+      <div id="set-body">
+        <div class="set-group">
+          <div class="set-group-title">外观</div>
+          <label class="set-row">
+            <span class="set-label">主题<em>深色接近 Windows Terminal 默认</em></span>
+            <select id="set-theme">
+              <option value="dark">深色</option>
+              <option value="light">浅色</option>
+            </select>
+          </label>
+          <label class="set-row">
+            <span class="set-label">字号<em>10 - 24，也可以用 Ctrl+= / Ctrl+-</em></span>
+            <span class="set-stepper">
+              <button type="button" class="step" data-step="-1">−</button>
+              <input id="set-fontsize" type="number" min="10" max="24" step="1">
+              <button type="button" class="step" data-step="1">+</button>
+            </span>
+          </label>
+          <label class="set-row">
+            <span class="set-label">光标闪烁</span>
+            <input id="set-blink" type="checkbox" class="switch">
+          </label>
+        </div>
+
+        <div class="set-group">
+          <div class="set-group-title">性能</div>
+          <label class="set-row">
+            <span class="set-label">WebGL 渲染<em>关掉改用 canvas，兼容性更好、发热更低</em></span>
+            <input id="set-webgl" type="checkbox" class="switch">
+          </label>
+          <label class="set-row">
+            <span class="set-label">回看行数<em>每个窗格保留的滚动缓冲</em></span>
+            <select id="set-scrollback">
+              <option value="2000">2 千行</option>
+              <option value="10000">1 万行</option>
+              <option value="50000">5 万行</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="set-group">
+          <div class="set-group-title">终端行为</div>
+          <label class="set-row">
+            <span class="set-label">选中即复制<em>拖选文字直接进剪贴板；右键在有选区时复制、没选区时粘贴</em></span>
+            <input id="set-copyselect" type="checkbox" class="switch">
+          </label>
+          <div class="set-note">
+            <span class="set-note-title">把程序留在后台</span>
+            <span class="set-note-text">
+              按住 <kbd>Shift</kbd> 点窗格右侧的 <kbd>×</kbd>，窗格会从界面上移走，里面正在跑的程序（比如服务器、构建、Claude Code）继续运行。
+              右上角的后台会话按钮可以看有哪些在后台，也可以随时接回来。
+            </span>
+          </div>
+        </div>
+
+        <div id="set-tip"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm" hidden>
+    <div id="cf-box" role="dialog" aria-modal="true" aria-label="确认">
+      <div id="cf-title"></div>
+      <div id="cf-text"></div>
+      <div id="cf-actions">
+        <button id="cf-cancel" type="button" class="btn">取消</button>
+        <button id="cf-alt" type="button" class="btn" hidden>只关界面</button>
+        <button id="cf-ok" type="button" class="btn primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 断线说明浮层。只在未连接时出现，鼠标移开就收，
+       所以不需要 Esc / 点外关闭那套逻辑。 -->
+  <div id="conn-tip" hidden role="status">
+    <div id="ct-head">
+      <span id="ct-title">连接已断开</span>
+      <span id="ct-badge">点击可重连</span>
+    </div>
+    <dl id="ct-rows">
+      <dt>原因</dt>
+      <dd id="ct-reason">未知</dd>
+      <dt>服务</dt>
+      <dd id="ct-server">正在检测…</dd>
+      <dt id="ct-gw-row" hidden>网关</dt>
+      <dd id="ct-gw" hidden>—</dd>
+      <dt>重连</dt>
+      <dd id="ct-retry">—</dd>
+    </dl>
+    <div id="ct-foot">点击这个按钮立即重试；也可以等它自己退避重连。</div>
+  </div>
+
+  <div id="bg-panel" hidden>
+    <div id="bg-box" role="dialog" aria-label="后台会话">
+      <header id="bg-head">
+        <span>后台会话</span>
+        <button id="bg-close" class="icon-btn" title="关闭（Esc）">✕</button>
+      </header>
+      <div id="bg-list">
+        <div id="bg-empty">没有在后台跑的会话</div>
+      </div>
+      <div id="bg-tip">按住 <kbd>Shift</kbd> 点窗格右侧的 <kbd>×</kbd>，可以把窗格收到这里：界面收起来，里面的程序继续跑。</div>
+    </div>
+  </div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="vendor/addon-unicode11.js"></script>
+  <script src="vendor/addon-webgl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

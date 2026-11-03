@@ -1,0 +1,13 @@
+# 仓库里统一存 LF。
+#
+# 这条不是洁癖：package/cmd/ 下的生命周期脚本要在 Linux 上直接执行，
+# CRLF 会让 bash 报 bad interpreter —— 装得上，但点"启动"毫无反应。
+# Windows 上检出后 .ps1 是 LF 也能正常跑，别改回去。
+* text=auto eol=lf
+
+# 二进制，别做换行或编码转换
+*.png binary
+*.ico binary
+*.fpk binary
+*.exe binary
+*.sock binary

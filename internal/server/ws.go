@@ -1,0 +1,267 @@
+package server
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"terminals/internal/proto"
+)
+
+// 心跳间隔必须小于网关的 proxy_read_timeout（飞牛是 300s），
+// 否则空闲终端会被网关掐断。
+const pingInterval = 20 * time.Second
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  32 * 1024,
+	WriteBufferSize: 32 * 1024,
+	CheckOrigin:     checkOrigin,
+}
+
+// 来源校验的三种结论。除"不匹配"外都放行，分开只是为了让
+// /api/wscheck 能把判断依据原样告诉前端。
+const (
+	originSame     = "same"
+	originNoHeader = "no-origin"
+	originMismatch = "mismatch"
+)
+
+// checkOrigin 防 CSWSH：只有同主机的页面才能建连。
+// 开发模式下放开，方便 localhost / 局域网调试。
+func checkOrigin(r *http.Request) bool {
+	return originVerdict(r) != originMismatch
+}
+
+// originVerdict 判断页面来源是否可信。
+//
+// 这里不能拿 Origin 和 r.Host 逐字比，也不能用 HasSuffix 拼出来比。
+// nginx 的 `proxy_set_header Host $host;` 会把端口去掉，而浏览器在非标准
+// 端口上访问时 Origin 一定带端口：飞牛的局域网入口是 http://<ip>:5666，
+// 远程访问是 https://<域名>（443）。逐字比的结果是"远程能用、局域网被判成
+// 跨站"，用户看到的现象恰好是"服务在线，但 WebSocket 一直连不上"。
+//
+// 所以先比完整的 host:port，再退一步只比主机名。端口在反代后面本来就可能
+// 被改写，主机名一致才是"同一个站点"更可靠的证据。
+func originVerdict(r *http.Request) string {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// 非浏览器客户端（curl / 脚本）。生产环境仍由管理员头把关。
+		return originNoHeader
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return originMismatch
+	}
+
+	for _, c := range originHosts(r) {
+		if sameHost(c, u.Host) {
+			return originSame
+		}
+	}
+	return originMismatch
+}
+
+// originHosts 列出所有可能代表"本站"的 host。
+// 网关改写 Host 的方式五花八门，多给几个候选比猜一个更靠谱。
+func originHosts(r *http.Request) []string {
+	out := make([]string, 0, 4)
+	for _, name := range []string{"X-Forwarded-Host", "X-Forwarded-Server", "X-Original-Host"} {
+		if v := firstValue(r.Header.Get(name)); v != "" {
+			out = append(out, v)
+		}
+	}
+	if r.Host != "" {
+		out = append(out, r.Host)
+	}
+	return out
+}
+
+func sameHost(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	ha, hb := hostOnly(a), hostOnly(b)
+	return ha != "" && strings.EqualFold(ha, hb)
+}
+
+// hostOnly 去掉端口。带方括号的 IPv6 也一并收拾掉，
+// 免得 "::1" 和 "[::1]" 被判成两台机器。
+func hostOnly(h string) string {
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return host
+	}
+	return strings.Trim(h, "[]")
+}
+
+// handleWSCheck 把"服务端眼里这次请求长什么样"报给前端。
+//
+// WebSocket 的失败在浏览器里一律是 1006，脚本拿不到 403/400 的区别，
+// 用户只能看到"连不上"。这个端点走同一条 HTTP 链路：能通就说明网关是通的，
+// 再把 Origin / Host 原样回给前端，断线浮层就能直接指出是不是网关改了 Host。
+func (s *Server) handleWSCheck(w http.ResponseWriter, r *http.Request) {
+	v := originVerdict(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"data": map[string]any{
+			"verdict":       v,
+			"accept":        v != originMismatch,
+			"origin":        r.Header.Get("Origin"),
+			"host":          r.Host,
+			"forwardedHost": firstValue(r.Header.Get("X-Forwarded-Host")),
+		},
+	})
+}
+
+func firstValue(v string) string {
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		return strings.TrimSpace(v[:i])
+	}
+	return strings.TrimSpace(v)
+}
+
+func atoiDefault(s string, def int) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+		if n > 10000 {
+			return def
+		}
+	}
+	if n <= 0 {
+		return def
+	}
+	return n
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	cols := atoiDefault(q.Get("cols"), 120)
+	rows := atoiDefault(q.Get("rows"), 32)
+	sid := q.Get("sid")
+
+	up := upgrader
+	if s.opt.Dev {
+		up.CheckOrigin = func(*http.Request) bool { return true }
+	}
+
+	conn, err := up.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	sess, err := s.mgr.GetOrCreate(sid, cols, rows)
+	if err != nil {
+		_ = conn.WriteMessage(websocket.BinaryMessage,
+			proto.Frame(proto.KindError, []byte(err.Error())))
+		return
+	}
+
+	client, replay, inAlt, needAltEnter := sess.Attach()
+	defer sess.Detach(client)
+
+	// READY 必须在回放之前发：前端要先知道 sid 和是否在备用屏幕。
+	readyJSON, _ := json.Marshal(sess.Ready(inAlt, needAltEnter))
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindReady, readyJSON)); err != nil {
+		return
+	}
+	if len(replay) > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindOutput, replay)); err != nil {
+			return
+		}
+	}
+
+	// 浏览器尺寸以它自己为准，连上来就把 PTY 改成一致。
+	_ = sess.Resize(cols, rows)
+
+	// 接回一个正跑着 TUI（vim / htop / claude）的会话时，回放给客户端的是"按当时
+	// 尺寸做的增量重绘"字节流；新窗口尺寸/重绘节奏对不上，屏上就是一片花。
+	//
+	// 这里让 PTY 尺寸抖一下：内核会给前台进程组补一个 SIGWINCH，这些程序收到信号
+	// 都会整屏重画，把回放留下的错位字符盖掉。只在备用屏幕里做 —— 普通 shell
+	// 不需要重画，抖了反而会让提示符闪一下。
+	if inAlt {
+		go func() {
+			_ = sess.Resize(cols-1, rows)
+			time.Sleep(80 * time.Millisecond)
+			_ = sess.Resize(cols, rows)
+		}()
+	}
+
+	// 单写协程：gorilla 不允许并发写，输出和心跳都从这里走。
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		ping := time.NewTicker(pingInterval)
+		defer ping.Stop()
+
+		for {
+			select {
+			case frame := <-client.Out():
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					conn.Close()
+					return
+				}
+			case <-ping.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil,
+					time.Now().Add(5*time.Second)); err != nil {
+					conn.Close()
+					return
+				}
+			case <-client.Done():
+				// 会话结束：把收尾的退出帧刷出去，再关连接解除读阻塞。
+				time.Sleep(100 * time.Millisecond)
+				conn.Close()
+				return
+			}
+		}
+	}()
+
+	conn.SetReadLimit(1 << 20)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * pingInterval))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(3 * pingInterval))
+	})
+
+	for {
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		if mt != websocket.BinaryMessage || len(data) == 0 {
+			continue
+		}
+		switch data[0] {
+		case proto.KindInput:
+			_ = sess.Write(data[1:])
+		case proto.KindResize:
+			var rs struct {
+				Cols int `json:"cols"`
+				Rows int `json:"rows"`
+			}
+			if json.Unmarshal(data[1:], &rs) == nil && rs.Cols > 0 && rs.Rows > 0 {
+				_ = sess.Resize(rs.Cols, rs.Rows)
+			}
+		case proto.KindSignal:
+			// M1 只处理 Ctrl+C：它走 INPUT 的 \x03，这里留空。
+		}
+	}
+
+	client.Close()
+	<-writerDone
+}

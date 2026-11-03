@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "terminals.Application": {
+      "title": "终端",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/terminals",
+      "gatewaySocket": "gateway.sock",
+      "url": "/app/terminals/",
+      "allUsers": false
+    }
+  }
+}

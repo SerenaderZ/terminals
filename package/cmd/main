@@ -1,0 +1,190 @@
+#!/bin/bash
+# TerminalS 的飞牛生命周期脚本：start / stop / status。
+#
+# 飞牛用 ${1} 传入动作，约定：
+#   start  启动成功返回 0，失败返回非 0（失败信息写 $TRIM_TEMP_LOGFILE 会在应用中心显示）
+#   stop   停止
+#   status 运行中返回 0，未运行返回 3
+#
+# 注意：这个文件必须保持 LF 换行。CRLF 会让 bash 报 "bad interpreter"，
+# 而且在应用中心里表现为"安装成功但启动无反应"，很难查。
+
+set -u
+
+APP_DIR="${TRIM_APPDEST:-/var/apps/terminals/target}"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/terminals/var}"
+BIN="${APP_DIR}/bin/tsd"
+SOCKET="${APP_DIR}/gateway.sock"
+BASE="/app/terminals"
+
+LOG_FILE="${VAR_DIR}/terminals.log"
+PID_FILE="${VAR_DIR}/app.pid"
+CONF_FILE="${VAR_DIR}/config.env"
+
+# 可选配置。存在就生效，用于覆盖降权账户、后端、shell 与工作目录：
+#   RUN_AS=yourname
+#   BACKEND=tmux
+#   TERMINAL_SHELL=/bin/bash
+#   TERMINAL_CWD=/vol1/1000
+# 刻意不叫 SHELL：SHELL 是登录环境自带的变量，混用会互相覆盖。
+RUN_AS=""
+BACKEND="native"
+TERMINAL_SHELL=""
+TERMINAL_CWD=""
+
+mkdir -p "${VAR_DIR}"
+if [ ! -f "${LOG_FILE}" ]; then
+  : > "${LOG_FILE}"
+  chmod 600 "${LOG_FILE}"
+fi
+
+log_msg() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${LOG_FILE}"
+}
+
+fail() {
+  log_msg "ERROR: $*"
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    printf '%s\n' "$*" > "${TRIM_TEMP_LOGFILE}"
+  fi
+  return 1
+}
+
+if [ -r "${CONF_FILE}" ]; then
+  # shellcheck disable=SC1090
+  . "${CONF_FILE}"
+fi
+
+read_pid() {
+  [ -r "${PID_FILE}" ] || return 1
+  tr -cd '0-9' < "${PID_FILE}"
+}
+
+check_process() {
+  local pid="$1"
+  [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+}
+
+status_app() {
+  local pid
+  pid="$(read_pid)" || return 1
+  check_process "${pid}" && [ -S "${SOCKET}" ]
+}
+
+stop_app() {
+  local pid count=0
+  pid="$(read_pid)" || {
+    rm -f "${PID_FILE}"
+    rm -f "${SOCKET}"
+    return 0
+  }
+
+  if ! check_process "${pid}"; then
+    rm -f "${PID_FILE}" "${SOCKET}"
+    return 0
+  fi
+
+  log_msg "stopping pid=${pid}"
+  kill -TERM "${pid}" 2>/dev/null
+
+  # tsd 收到 SIGTERM 会关 HTTP、删 socket，正常 5 秒内退出。
+  while check_process "${pid}" && [ "${count}" -lt 10 ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+
+  if check_process "${pid}"; then
+    log_msg "force killing pid=${pid}"
+    kill -KILL "${pid}" 2>/dev/null
+    sleep 1
+  fi
+
+  rm -f "${PID_FILE}" "${SOCKET}"
+  log_msg "stopped"
+  return 0
+}
+
+start_app() {
+  local count=0
+  local pid
+  local -a args
+
+  if status_app; then
+    log_msg "already running"
+    return 0
+  fi
+
+  # 上次可能被 kill -9 掉，留下 pid 文件和一个没人监听的 socket。
+  stop_app >/dev/null 2>&1
+
+  [ -f "${BIN}" ] || {
+    fail "找不到 ${BIN}，安装包可能不完整"
+    return 1
+  }
+  # fnpack 在 Windows 上打包时可能丢掉可执行位，这里补一次，代价只有一次 chmod。
+  chmod 755 "${BIN}" 2>/dev/null
+
+  [ -x /bin/bash ] || {
+    fail "/bin/bash 不存在，无法启动会话"
+    return 1
+  }
+
+  args=(--socket "${SOCKET}" --base "${BASE}" --data-dir "${VAR_DIR}" --backend "${BACKEND}")
+  if [ -n "${RUN_AS}" ]; then
+    args+=(--run-as "${RUN_AS}")
+  fi
+  if [ -n "${TERMINAL_SHELL}" ]; then
+    args+=(--shell "${TERMINAL_SHELL}")
+  fi
+  if [ -n "${TERMINAL_CWD}" ]; then
+    args+=(--cwd "${TERMINAL_CWD}")
+  fi
+
+  log_msg "starting: ${BIN} ${args[*]}"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${BIN}" "${args[@]}" </dev/null >>"${LOG_FILE}" 2>&1 &
+  else
+    nohup "${BIN}" "${args[@]}" </dev/null >>"${LOG_FILE}" 2>&1 &
+  fi
+  pid=$!
+  printf '%s\n' "${pid}" > "${PID_FILE}"
+
+  # 等 socket 出现。最多 15 秒 —— 首次启动要探测 locale、解析账户。
+  while [ ! -S "${SOCKET}" ] && [ "${count}" -lt 15 ]; do
+    sleep 1
+    count=$((count + 1))
+    if ! check_process "${pid}"; then
+      break
+    fi
+  done
+
+  if [ ! -S "${SOCKET}" ] || ! check_process "${pid}"; then
+    log_msg "start failed, tail of log:"
+    tail -n 20 "${LOG_FILE}" >> "${LOG_FILE}" 2>/dev/null
+    rm -f "${PID_FILE}"
+    fail "启动失败，详见 ${LOG_FILE}"
+    return 1
+  fi
+
+  log_msg "started pid=${pid}"
+  return 0
+}
+
+case "${1:-}" in
+  start)
+    start_app
+    ;;
+  stop)
+    stop_app
+    ;;
+  status)
+    if status_app; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    fail "用法：$0 {start|stop|status}"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,3 @@
+#!/bin/bash
+# 升级前调用。会话状态都在 $TRIM_PKGVAR 里，升级不会清理它。
+exit 0

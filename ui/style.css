@@ -1,0 +1,947 @@
+/* TerminalS 样式。整体参考 Windows Terminal 的深色主题：
+   紧凑标题栏 + 扁平标签 + 终端占满剩余区域，不做多余的装饰。 */
+
+:root {
+  --bg: #0c0c0c;
+  --bg-chrome: #1f1f1f;
+  --bg-chrome-hover: #2b2b2b;
+  --fg: #cccccc;
+  --fg-dim: #8b8b8b;
+  --border: #2e2e2e;
+  --accent: #4cc2ff;
+  --accent-soft: rgba(76, 194, 255, 0.45);
+  --danger: #e5534b;
+  --warn: #d29922;
+  /* 滚动条滑块。系统默认在深色背景上是一条惨白的轨道，很扎眼，
+     所以凡是能滚的地方都换成这套颜色。 */
+  --scroll-thumb: #3f3f3f;
+  --scroll-thumb-hover: #5a5a5a;
+  --titlebar-h: 40px;
+
+  /* 原生控件（滚动条、下拉框、数字框、复选框）的配色由 color-scheme 决定。
+     只改 CSS 变量不改这个的话，深色面板里会冒出一条惨白的系统滚动条 ——
+     就是"没统一"的来源。声明成 dark 之后，浏览器自己就把它们画成深色，
+     下面的 ::-webkit-scrollbar 只是在此基础上把宽度和圆角收一收。 */
+  color-scheme: dark;
+  scrollbar-color: var(--scroll-thumb) transparent;
+  scrollbar-width: thin;
+  --font-ui: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Sarasa Mono SC", "Noto Sans Mono CJK SC",
+    "Microsoft YaHei Mono", "Consolas", "DejaVu Sans Mono", monospace;
+}
+
+html[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-chrome: #f3f3f3;
+  --bg-chrome-hover: #e8e8e8;
+  --fg: #1f1f1f;
+  --fg-dim: #6b6b6b;
+  --border: #dcdcdc;
+  --accent: #0067c0;
+  --accent-soft: rgba(0, 103, 192, 0.4);
+  --scroll-thumb: #c4c4c4;
+  --scroll-thumb-hover: #9a9a9a;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------------------------------------------------------- 标题栏 */
+
+#titlebar {
+  display: flex;
+  align-items: stretch;
+  height: var(--titlebar-h);
+  flex: 0 0 var(--titlebar-h);
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+#tabstrip {
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  scrollbar-width: none;
+  max-width: 70%;
+}
+#tabstrip::-webkit-scrollbar { display: none; }
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  min-width: 120px;
+  max-width: 220px;
+  border-right: 1px solid var(--border);
+  color: var(--fg-dim);
+  cursor: default;
+  position: relative;
+  font-size: 12px;
+}
+
+.tab.active {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* WT 的焦点标签底部有一条强调线 */
+.tab.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+}
+
+.tab .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.tab .close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.tab:hover .close { opacity: 0.7; }
+.tab .close:hover { background: var(--bg-chrome-hover); opacity: 1; }
+
+#spacer { flex: 1; }
+
+/* 连接状态本身就是一个按钮：断开时能点、能悬停看原因，连上之后彻底不响应鼠标。
+   pointer-events 是这里的关键 —— 它同时关掉了 title 提示、悬停高亮和点击，
+   不需要靠 disabled 属性（disabled 的按钮在部分浏览器里仍会弹原生 tooltip）。 */
+#status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  font-family: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+  pointer-events: none;
+  transition: background 0.12s, color 0.12s;
+}
+
+#status.down {
+  pointer-events: auto;
+  cursor: pointer;
+  color: var(--fg);
+}
+
+#status.down:hover { background: var(--bg-chrome-hover); }
+
+#status.down:active { background: var(--border); }
+
+#status.reconnecting { cursor: progress; }
+
+.led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6b6b6b;
+  flex: 0 0 auto;
+}
+.led.online { background: #3fb950; }
+.led.connecting { background: var(--warn); }
+.led.offline { background: var(--danger); }
+
+.badge {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 18px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.icon-btn:hover { background: var(--bg-chrome-hover); color: var(--fg); }
+
+/* "结束全部"是破坏性动作，但不用红色 —— 红色常驻在标题栏上太吵。
+   靠一条细边框和悬停时的浅色底把它和旁边的新建/分屏区分开。 */
+#btn-close-all { border-left: 1px solid var(--border); width: 44px; }
+#btn-close-all:hover { color: var(--fg); }
+
+/* 后台会话：按钮右上角一个小圆点显示数量。没有后台会话时整个点都不显示，
+   不然标题栏上会常驻一个"0"，看着像坏了。 */
+#btn-bg { position: relative; }
+
+#bg-count {
+  position: absolute;
+  top: 5px;
+  right: 4px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  background: var(--accent);
+  color: #06212e;
+  border-radius: 7px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+html[data-theme="light"] #bg-count { color: #fff; }
+
+/* 窄屏（手机）上标题栏放不下这么多按钮，先把状态文字收掉，
+   标签至少要留出能看清标题的宽度。 */
+@media (max-width: 640px) {
+  #status #statustext { display: none; }
+  #status { padding: 0 8px; }
+  #tabstrip { max-width: 60%; }
+  .icon-btn { width: 36px; }
+  #btn-close-all { width: 40px; }
+}
+
+/* ---------------------------------------------------------------- 终端区 */
+
+#panes {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  background: var(--bg);
+}
+
+/* 一个标签一层。隐藏的标签只是不显示，里面的 xterm 和 WS 都还活着 ——
+   切回来是瞬间的，不是重连。 */
+.tabview {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+.tabview.hidden { display: none; }
+
+/* 分割容器：子节点按 flex-grow 分空间，比例由拖拽写回布局树。 */
+.split {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+.split.dir-row { flex-direction: row; }
+.split.dir-col { flex-direction: column; }
+
+.sc {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 分隔条。6px 是"够好点"和"不浪费一列字"之间的折中。 */
+.gutter {
+  flex: 0 0 6px;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+.gutter.v { cursor: col-resize; }
+.gutter.h { cursor: row-resize; }
+.gutter::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  transition: background 120ms linear;
+}
+.gutter:hover::after,
+.gutter.dragging::after { background: var(--accent); opacity: 0.55; }
+.gutter.v::after { left: 2px; right: 2px; }
+.gutter.h::after { top: 2px; bottom: 2px; }
+
+/* 拖拽期间禁掉选中和光标抖动 */
+body.resizing { user-select: none; }
+body.resizing * { cursor: inherit !important; }
+body.resizing { cursor: col-resize; }
+
+.pane {
+  display: none;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 0 0 4px;
+  position: relative;
+  outline: 1px solid transparent;
+  outline-offset: -1px;
+}
+
+/* 聚焦窗格给一条细边。分屏多了以后，不给提示根本分不清键盘在哪个窗格里。
+   用半透明强调色而不是实色：太亮会盖过终端内容，Windows Terminal 也是这个分寸。 */
+.pane.focused { outline-color: var(--accent-soft); }
+.pane.exited .terminal-host { opacity: 0.75; }
+
+.pane.broken {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.pane .terminal-host {
+  /* flex 里不要给 width:100% —— 右侧还有一条轨道，100% 会把轨道挤出可视区。
+     基准设 0、靠 grow 吃掉剩余宽度，xterm 量到的就是真实可用宽度。 */
+  flex: 1 1 0;
+  width: auto;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 窗格右侧的竖轨道：顶上 ×（关这个窗格），下面自绘滚动条。
+   用 flex 占一列而不是绝对定位盖在终端上 —— 盖住最右一列字，
+   而且那一列的点击会落到轨道上，光标点不过去。 */
+.pane .pane-rail {
+  flex: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-height: 0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 关闭按钮：两个斜杠画一个 ×，任意宽度都不会被字体裁掉。 */
+.pane .pane-close {
+  position: relative;
+  flex: 0 0 12px;
+  width: 100%;
+  height: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--fg-dim);
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.12s linear, color 0.12s linear, background 0.12s linear;
+}
+
+.pane .pane-close::before,
+.pane .pane-close::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 7px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+.pane .pane-close::before { transform: translate(-50%, -50%) rotate(45deg); }
+.pane .pane-close::after { transform: translate(-50%, -50%) rotate(-45deg); }
+
+/* 悬停不用红色：红色在这么小的按钮上像报错，也压过终端内容。
+   用同一套灰阶做"色差"——底亮一档、字亮到正文色，安静但看得出来。 */
+.pane .pane-close:hover {
+  opacity: 1;
+  color: var(--fg);
+  background: var(--bg-chrome-hover);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.pane .pane-close:active { background: var(--border); }
+
+/* 只有一个窗格时不需要 ×，但位置要留着 —— 用 visibility 而不是 display，
+   否则滚动条的顶端会往上跳一格。 */
+.tabview.solo .pane-close { visibility: hidden; pointer-events: none; }
+
+.pane .pane-track {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  margin-top: 4px;
+  cursor: default;
+}
+
+.pane .pane-thumb {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  top: 0;
+  min-height: 18px;
+  border-radius: 3px;
+  background: #3f3f3f;
+  opacity: 0.85;
+  transition: background 0.12s linear, opacity 0.12s linear;
+}
+
+.pane .pane-thumb[hidden] { display: none; }
+.pane .pane-thumb:hover,
+.pane .pane-thumb.dragging { background: #5a5a5a; opacity: 1; }
+
+html[data-theme="light"] .pane .pane-thumb { background: #c4c4c4; }
+html[data-theme="light"] .pane .pane-thumb:hover,
+html[data-theme="light"] .pane .pane-thumb.dragging { background: #9a9a9a; }
+
+/* 自己画了滚动条，浏览器原生那条一律藏掉 —— 否则右边会出现两条，
+   而且原生那条还可能压在轨道上。 */
+.xterm .xterm-viewport {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.xterm .xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
+
+#banner {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 6px 14px;
+  border-radius: 6px;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 12px;
+  z-index: 10;
+}
+
+#banner.warn { border-color: var(--warn); color: var(--warn); }
+#banner.error { border-color: var(--danger); color: var(--danger); }
+#banner.info { border-color: var(--accent); color: var(--accent); }
+/* 需要用户动手的提示：和 info 同一个色系，但文字保持正常色，
+   免得读起来像报错。 */
+#banner.ask { border-color: var(--accent); color: var(--fg); }
+
+/* ---------------------------------------------------------- 断线说明浮层 */
+
+/* 只在未连接时出现：它回答的是"为什么不连上、我还要等多久"，
+   这两件事在连上的那一刻就都不成立了。 */
+#conn-tip {
+  position: fixed;
+  z-index: 60;
+  width: min(340px, calc(100vw - 16px));
+  padding: 10px 12px 11px;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  -webkit-app-region: no-drag;
+}
+
+#conn-tip[hidden] { display: none; }
+
+/* 指向按钮的小尖角，水平位置由 JS 算好塞进 --ct-arrow。 */
+#conn-tip::before {
+  content: "";
+  position: absolute;
+  top: -5px;
+  left: var(--ct-arrow, 24px);
+  width: 8px;
+  height: 8px;
+  background: var(--bg-chrome);
+  border-left: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  transform: rotate(45deg);
+}
+
+#ct-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+#ct-title {
+  color: var(--fg);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+#ct-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 10.5px;
+}
+
+/* 两列网格：左边是字段名，右边是值。值可以换行，但不能撑破卡片。 */
+#ct-rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 10px;
+  margin: 9px 0 0;
+}
+
+#ct-rows dt {
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+#ct-rows dd {
+  margin: 0;
+  color: var(--fg);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+/* dt/dd 默认是 block，[hidden] 的 display:none 会被上面的规则之外的
+   样式覆盖掉一半，这里显式写死，避免隐藏后还占一格网格。 */
+#ct-rows [hidden] { display: none; }
+
+#ct-foot {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------- 后台会话面板 */
+
+/* 下拉浮层而不是遮罩：#bg-panel 本身不挡住终端，只有 #bg-box 那一块浮在上面。
+   这样用户能一边看清单一边操作终端。 */
+#bg-panel {
+  position: absolute;
+  top: var(--titlebar-h);
+  right: 8px;
+  z-index: 45;
+}
+
+#bg-panel[hidden] { display: none; }
+
+#bg-box {
+  display: flex;
+  flex-direction: column;
+  width: min(440px, 92vw);
+  max-height: min(62vh, 440px);
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+#bg-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 6px 8px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#bg-head .icon-btn { width: 28px; height: 26px; font-size: 13px; }
+
+#bg-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 4px 0;
+
+  /* 和设置面板一样，滚动条必须自己画成深色，否则会露出一条白轨道。 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+#bg-list::-webkit-scrollbar { width: 10px; }
+#bg-list::-webkit-scrollbar-track { background: transparent; }
+#bg-list::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 6px;
+}
+#bg-list::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: content-box;
+}
+
+.bg-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.bg-item:hover { background: var(--bg-chrome-hover); }
+
+.bg-main { flex: 1 1 auto; min-width: 0; }
+
+.bg-title {
+  color: var(--fg);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bg-meta {
+  margin-top: 2px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bg-item .btn {
+  flex: 0 0 auto;
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11.5px;
+}
+
+.bg-empty {
+  padding: 20px 14px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+#bg-tip {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+kbd {
+  padding: 0 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+}
+
+/* -------------------------------------------------------------- 设置面板 */
+
+/* 和终端同层覆盖，不改变 #panes 的尺寸 —— 否则开着设置面板就会触发
+   一次 xterm resize，TUI 会重排、闪一下。 */
+#settings {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: calc(var(--titlebar-h) + 24px);
+  background: rgba(0, 0, 0, 0.45);
+}
+
+html[data-theme="light"] #settings { background: rgba(0, 0, 0, 0.18); }
+
+/* display:flex 会盖掉 [hidden] 的 UA 规则，必须显式写回来。 */
+#settings[hidden] { display: none; }
+
+#set-box {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 92vw);
+  max-height: min(76vh, 640px);
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+#set-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px 10px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#set-body {
+  flex: 1 1 auto;
+  padding: 4px 16px 16px;
+  overflow-y: auto;
+
+  /* 用主题色画滚动条。不写这一套，Windows 上会露出一条白底滚动条，
+     在深色面板里像贴了一张纸。scrollbar-* 给 Firefox / 新 Chrome，
+     ::-webkit-scrollbar 给老一点的 WebKit。 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+/* 占位要留够，否则内容会顶着滑块走。 */
+#set-body::-webkit-scrollbar { width: 10px; }
+#set-body::-webkit-scrollbar-track { background: transparent; }
+#set-body::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 6px;
+}
+#set-body::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); background-clip: content-box; }
+
+.set-group-title {
+  margin: 14px 0 6px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 40px;
+  padding: 6px 0;
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.set-label { display: flex; flex-direction: column; gap: 2px; }
+.set-label em {
+  max-width: 330px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.4;
+}
+
+/* 纯说明块（不是开关）。按键手势这种东西没法做成复选框，
+   但必须让用户能发现它，否则 Shift+点 × 等于不存在。 */
+.set-note {
+  margin: 8px 0 2px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.set-note-title {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.set-note-text {
+  display: block;
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.set-row select,
+.set-row input[type="number"] {
+  height: 28px;
+  padding: 0 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  outline: none;
+}
+
+.set-row select:focus,
+.set-row input[type="number"]:focus { border-color: var(--accent); }
+
+.set-row input[type="number"] { width: 52px; text-align: center; }
+
+.set-stepper { display: flex; align-items: center; gap: 4px; }
+.set-stepper .step {
+  width: 26px;
+  height: 28px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.set-stepper .step:hover { background: var(--bg-chrome-hover); }
+
+/* 开关：用 appearance:none 自绘，避免不同浏览器自带的 checkbox 尺寸不一致。 */
+input.switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  margin: 0;
+  background: var(--border);
+  border-radius: 11px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+input.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.15s ease;
+}
+
+input.switch:checked { background: var(--accent); }
+input.switch:checked::after { transform: translateX(16px); }
+input.switch:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 2px; }
+
+#set-tip {
+  margin-top: 14px;
+  min-height: 16px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+#set-tip.warn { color: var(--warn); }
+
+/* -------------------------------------------------------------- 确认框 */
+
+/* 破坏性动作（结束全部）要二次确认。不用浏览器原生 confirm：
+   原生弹窗会抢走键盘焦点，回来以后终端的焦点状态要重新收拾。 */
+#confirm {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+html[data-theme="light"] #confirm { background: rgba(0, 0, 0, 0.18); }
+
+/* display:flex 会盖掉 [hidden] 的 UA 规则，必须显式写回来。 */
+#confirm[hidden] { display: none; }
+
+#cf-box {
+  width: min(420px, 88vw);
+  padding: 18px 18px 14px;
+  background: var(--bg-chrome);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+#cf-title {
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+#cf-text {
+  color: var(--fg-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+#cf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.btn {
+  height: 30px;
+  padding: 0 14px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn:hover { background: var(--bg-chrome-hover); }
+.btn:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 1px; }
+
+/* 主按钮用强调色，不用红色：红色留给"出错了"，不留给"确认操作"。 */
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06212e;
+}
+html[data-theme="light"] .btn.primary { color: #fff; }
+.btn.primary:hover { filter: brightness(1.08); }
+
+/* 破坏性按钮（结束一个后台会话）。边框用红，但底色不填红：
+   面板里一排按钮全是大红块会太吵。 */
+.btn.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.btn.danger:hover { background: rgba(229, 83, 75, 0.12); }
