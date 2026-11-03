@@ -27,7 +27,8 @@ One Go binary plus an xterm.js frontend, with every frontend asset embedded in t
 
 - Runs as an unprivileged account by default; `sudo -i` inside the terminal if you need root — no sudoers file is ever written
 - All shortcuts use `Ctrl+Alt` (`Ctrl+Shift+T/W` are taken by the browser, `Alt+Shift` is an IME hotkey on Windows)
-- Right-click depends only on selection: with a selection it copies, without one it pastes — a single click either way
+- Right-click depends only on selection: with a selection it copies, without one it pastes — a single click either way; the selection is dropped right after copying, so copy → right-click → paste chains up
+- Full-screen programs (vim, htop, Claude Code) capture the mouse; hold `Shift` while dragging to select, and the highlight survives the program's redraws
 - Auto-copy on selection (can be disabled); `Ctrl+Shift+C/V` and `Ctrl+Insert`/`Shift+Insert` also work
 - Settings are stored server-side: theme, font size, cursor blink, WebGL toggle, scrollback, copy-on-select
 - The connection indicator is a button: when disconnected, hover to see the reason, whether the server itself is alive, and the countdown to the next retry; click to reconnect immediately

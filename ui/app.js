@@ -553,6 +553,8 @@
       });
     }
 
+    this.installProtocolGuard();
+
     term.onData(function (data) {
       self.send(C.INPUT, new TextEncoder().encode(data));
     });
@@ -600,20 +602,18 @@
     // 应用复制了别的东西，这时粘旧内容比多点一次菜单更糟，所以直接作废、
     // 把右键交还给浏览器原生菜单（那条路能粘任意内容，只是要多点一下）。
     host.addEventListener('contextmenu', function (e) {
-      if (self.copy()) {
+      // 规则只有一条，程序里外都一样：
+      //   有选中 → 复制；没选中 → 粘贴。
+      //
+      // 复制之后立刻把选区收掉，所以"复制 → 右键 → 粘贴"这个最常走的
+      // 两连击是自洽的：第一次右键拿走选中内容，第二次右键因为没有选区，
+      // 自然就是粘贴。留着选区的话用户会一直复制，永远粘不上。
+      var text = self.selectionText();
+      if (text) {
         e.preventDefault();
-        banner('已复制 ' + self.term.getSelection().length + ' 个字符', 'ok');
-        return;
-      }
-
-      // 全屏 TUI（Claude Code / vim / htop）会打开鼠标追踪，把左键拖动收走
-      // 发给程序自己 —— 用户看着像选中了（程序自己画高亮），xterm 这边其实
-      // 一个选区都没有。这时候绝不能按"没选区就粘贴"处理：那是把上一段无关
-      // 内容直接灌进对方的输入框，比什么都不做更糟。所以只说明怎么真选中。
-      if (self.mouseGrabbed()) {
-        e.preventDefault();
-        self.focus();
-        banner('这个程序接管了鼠标，按住 Shift 再拖动才能选中文字', 'ask');
+        self.copyText(text);
+        self.clearSelection();
+        banner('已复制 ' + text.length + ' 个字符', 'ok');
         return;
       }
 
@@ -641,12 +641,19 @@
     try {
       if (term.onSelectionChange) {
         term.onSelectionChange(function () {
+          // 每次真的选中东西都留一份快照。作用是兜底：哪怕高亮被程序
+          // 后续的输出冲掉（协议重设、清屏重绘），用户几秒内右键仍能
+          // 复制到刚选的那段，而不是撞进"没选区就粘贴"。
+          var sel = self.term && self.term.getSelection();
+          if (sel) self.selSnap = { text: sel, at: Date.now() };
+
           if (!self.owner || !self.owner.settings.copyOnSelect) return;
           clearTimeout(self.selTimer);
           self.selTimer = setTimeout(function () {
             if (self.disposed || !self.term) return;
-            if (!self.term.hasSelection()) return;
-            self.copy();
+            var text = self.selectionText();
+            if (!text) return;
+            self.copyText(text);
           }, 160);
         });
       }
@@ -1095,26 +1102,70 @@
     if (this.term) this.term.focus();
   };
 
-  // mouseGrabbed 表示当前程序开着鼠标追踪（DECSET 1000/1002/1003）。
+  // installProtocolGuard 堵住 xterm 的一个小疏漏：重复设置同一个鼠标协议
+  // 会清掉选区。
   //
-  // 这种模式下 xterm 把左键按下/拖动/滚轮当成鼠标事件转给程序，不再建立
-  // 选区 —— 想选字必须按住 Shift，那是不被拦截的唯一出口。判断这个是为了
-  // 在右键时区分"用户真的没选"和"用户以为选了但选不上"。
-  Session.prototype.mouseGrabbed = function () {
+  // set activeProtocol(v) 不做幂等判断，无条件 fire onProtocolChange；而
+  // SelectionService 订阅了这个事件，收到就把选区清空。全屏程序（Claude
+  // Code、vim、htop）在重绘或状态变化时会反复发 \x1b[?1000h —— 协议明明
+  // 没变，选区却被清掉了。用户那边的现象就是"Shift 拖完一松手，高亮就没了，
+  // 根本来不及右键"。
+  //
+  // 这里只短路"值没变"的调用，真切换协议（1000 → 1002 → NONE）照旧触发。
+  // 内部结构若在别的 xterm 版本里改名，直接放弃保护 —— 复制功能另有快照
+  // 兜底，不会因此坏掉。
+  Session.prototype.installProtocolGuard = function () {
     try {
-      var m = this.term && this.term.modes && this.term.modes.mouseTrackingMode;
-      return !!m && m !== 'none';
-    } catch (e) {
-      return false;
-    }
+      var ms = this.term && this.term._core && this.term._core.coreMouseService;
+      if (!ms || ms.__tsGuarded) return;
+      var desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ms), 'activeProtocol');
+      if (!desc || !desc.get || !desc.set) return;
+      Object.defineProperty(ms, 'activeProtocol', {
+        configurable: true,
+        get: function () { return desc.get.call(this); },
+        set: function (v) {
+          if (desc.get.call(this) === v) return;
+          desc.set.call(this, v);
+        }
+      });
+      ms.__tsGuarded = true;
+    } catch (e) { /* 内部结构对不上就不保护了 */ }
   };
 
-  // copy 把当前选区写进系统剪贴板，返回是否真的复制到了东西。
-  //
-  // 没有选区时返回 false —— 右键菜单用它来决定"复制"还是"粘贴"。
+  // 快照的有效期。正常路径上用不到它（协议保护会保住高亮），它是给
+  // "高亮已经消失、但用户确实刚选过"这种情况兜底的。太长会误伤 ——
+  // 用户选完过一会儿想粘贴，却被当成又一次复制。
+  var SEL_SNAP_TTL = 15000;
+
+  // selectionText 返回"这次右键该复制的内容"：优先当前真实选区，
+  // 退回到 15 秒内的选区快照。
+  Session.prototype.selectionText = function () {
+    if (!this.term) return '';
+    var now = this.term.getSelection();
+    if (now) return now;
+    if (this.selSnap && Date.now() - this.selSnap.at < SEL_SNAP_TTL) return this.selSnap.text;
+    return '';
+  };
+
+  // clearSelection 连同快照一起作废 —— 复制完就走这条路，
+  // 于是紧接着的下一次右键必然是粘贴。
+  Session.prototype.clearSelection = function () {
+    this.selSnap = null;
+    try { if (this.term) this.term.clearSelection(); } catch (e) { }
+  };
+
+  // copy 复制当前选区（快捷键走这里），返回是否真的复制到了东西。
+  // 与右键共用 selectionText，所以高亮已被冲掉时快照内容也能复制；
+  // 区别是这里不清选区 —— Ctrl+Insert 之后多半还要继续用鼠标。
   Session.prototype.copy = function () {
-    if (!this.term) return false;
-    var text = this.term.getSelection();
+    var text = this.selectionText();
+    if (!text) return false;
+    this.copyText(text);
+    return true;
+  };
+
+  // copyText 把一段文本写进系统剪贴板。
+  Session.prototype.copyText = function (text) {
     if (!text) return false;
 
     // 无论系统剪贴板写不写得进去，都在页面内留一份 —— http 下右键粘贴
@@ -1139,7 +1190,7 @@
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
     document.body.removeChild(ta);
     if (!ok) banner('浏览器不允许写入剪贴板，请用 Ctrl+Insert 或系统复制', 'warn');
-    return true; // 有选区就算"复制"这个意图成立，调用方不必再退到粘贴
+    return true; // 有内容就算"复制"这个意图成立，调用方不必再退到粘贴
   };
 
   // paste 把系统剪贴板的内容送进终端。

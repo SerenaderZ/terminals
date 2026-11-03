@@ -118,25 +118,10 @@ const bufText = (page) => page.evaluate(() => {
   });
   check('全屏程序徽章出现', modes.alt === 'alternate' && modes.badge, `buffer=${modes.alt} badge=${modes.badge}`);
 
-  // 拖选（被鼠标追踪吃掉，不会产生选区）
+  // 右键的语义在 ui-sel.mjs 里统一验证（有选中复制、没选中粘贴，程序里外
+  // 都一样）。这里只确认鼠标被程序接管时，Shift 拖动仍然能建立真正的选区 ——
+  // 那是全屏程序下唯一的选择入口。
   box = await boxOf(pB);
-  await pB.mouse.move(box.x + 10, box.y + 12);
-  await pB.mouse.down();
-  await pB.mouse.move(box.x + 240, box.y + 12, { steps: 6 });
-  await pB.mouse.up();
-  await sleep(300);
-
-  // 右键
-  await pB.mouse.click(box.x + 120, box.y + 12, { button: 'right' });
-  await sleep(600);
-  const after = await pB.evaluate(() => ({
-    banner: (document.getElementById('banner') || {}).textContent || '',
-    hidden: (document.getElementById('banner') || {}).hidden,
-  }));
-  const text = await bufText(pB);
-  check('右键给出 Shift 提示，而不是静默粘贴',
-    /Shift/.test(after.banner) && !after.hidden, JSON.stringify(after.banner));
-  check('没有把内部剪贴板内容灌进 TUI', !text.includes('PASTE_MARKER_777'));
 
   // 按住 Shift 拖动应当能选中
   await pB.keyboard.down('Shift');
