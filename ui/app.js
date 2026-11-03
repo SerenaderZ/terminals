@@ -253,8 +253,11 @@
           self.sid = info.sid;
           self.ws.save();
         }
-        if (self.focused) self.ws.setAlt(!!info.altScreen);
-      }
+        self.setAlt(!!info.altScreen);
+      },
+      // 全屏标记跟着"这一格是否被全屏程序占着"走，而不是跟着"最后一次连接
+      // 时的状态"走 —— 否则切到别的窗格、或者 vim 退出，标记都会停在原地。
+      onAlt: function (on) { self.setAlt(on); }
     });
 
     this.session.mountSection(this.host);
@@ -388,10 +391,19 @@
     });
   };
 
+  // setAlt 记下"这一格是不是被全屏程序占着"，焦点在这一格时同时刷标题栏。
+  // 记在 Pane 上而不是全局，是因为分屏后每个窗格各有各的状态：一格在跑
+  // Claude Code，另一格是普通 shell，徽章只能反映焦点那一格。
+  Pane.prototype.setAlt = function (on) {
+    this.alt = !!on;
+    if (this.focused) this.ws.setAlt(this.alt);
+  };
+
   Pane.prototype.focus = function () {
     this.focused = true;
     this.el.classList.add('focused');
     this.ws.setStatus();
+    this.ws.setAlt(!!this.alt);
     this.session.focus();
   };
 
@@ -593,6 +605,18 @@
         banner('已复制 ' + self.term.getSelection().length + ' 个字符', 'ok');
         return;
       }
+
+      // 全屏 TUI（Claude Code / vim / htop）会打开鼠标追踪，把左键拖动收走
+      // 发给程序自己 —— 用户看着像选中了（程序自己画高亮），xterm 这边其实
+      // 一个选区都没有。这时候绝不能按"没选区就粘贴"处理：那是把上一段无关
+      // 内容直接灌进对方的输入框，比什么都不做更糟。所以只说明怎么真选中。
+      if (self.mouseGrabbed()) {
+        e.preventDefault();
+        self.focus();
+        banner('这个程序接管了鼠标，按住 Shift 再拖动才能选中文字', 'ask');
+        return;
+      }
+
       if (navigator.clipboard && window.isSecureContext) {
         e.preventDefault();
         self.paste();
@@ -634,7 +658,14 @@
     // 代价只是一次 refresh，肉眼无感。
     try {
       if (term.buffer && term.buffer.onBufferChange) {
-        this.bufSub = term.buffer.onBufferChange(function () { self.afterBufferSwap(); });
+        this.bufSub = term.buffer.onBufferChange(function () {
+          // 进出备用屏幕要顺手更新"全屏"标记：它说的是"这一格现在被全屏
+          // 程序占着"，vim 退出了就该消失，不该等到下次连上才刷新。
+          var inAlt = term.buffer.active.type === 'alternate';
+          self.alt = inAlt;
+          self.opts.onAlt && self.opts.onAlt(inAlt);
+          self.afterBufferSwap();
+        });
       }
     } catch (e) { /* 老版本 xterm 没有这个事件，忽略 */ }
 
@@ -1062,6 +1093,20 @@
     // 焦点过来时补挂 WebGL：之前可能因为池满或藏在别的标签里没挂上。
     this.attachWebgl();
     if (this.term) this.term.focus();
+  };
+
+  // mouseGrabbed 表示当前程序开着鼠标追踪（DECSET 1000/1002/1003）。
+  //
+  // 这种模式下 xterm 把左键按下/拖动/滚轮当成鼠标事件转给程序，不再建立
+  // 选区 —— 想选字必须按住 Shift，那是不被拦截的唯一出口。判断这个是为了
+  // 在右键时区分"用户真的没选"和"用户以为选了但选不上"。
+  Session.prototype.mouseGrabbed = function () {
+    try {
+      var m = this.term && this.term.modes && this.term.modes.mouseTrackingMode;
+      return !!m && m !== 'none';
+    } catch (e) {
+      return false;
+    }
   };
 
   // copy 把当前选区写进系统剪贴板，返回是否真的复制到了东西。

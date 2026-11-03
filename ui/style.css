@@ -179,12 +179,17 @@ body {
 .led.connecting { background: var(--warn); }
 .led.offline { background: var(--danger); }
 
+/* "全屏程序"是状态标记，不是按钮：没有边框、没有手型，避免被当成能点的
+   东西（它嵌在连接状态按钮里，那个按钮在有连接时本来就不可点）。 */
 .badge {
   padding: 1px 6px;
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: 4px;
+  background: rgba(127, 127, 127, 0.18);
   color: var(--fg-dim);
   font-size: 11px;
+  cursor: default;
+  user-select: none;
 }
 
 .icon-btn {

@@ -349,6 +349,29 @@ func (s *Session) Resize(cols, rows int) error {
 	return s.proc.Resize(cols, rows)
 }
 
+// Nudge 让 PTY 尺寸抖一下（少一列再回来），逼全屏程序整屏重画。
+//
+// 为什么需要：接回会话时回放的是"按旧尺寸画的"字节流，新窗口尺寸对不上就是
+// 一片花；而 TUI 只在收到 SIGWINCH 时才重绘，尺寸恰好没变的话它永远不重画。
+//
+// 为什么读当前尺寸、而不是接受调用方传参：抖动要花 80ms，这期间浏览器可能
+// 已经 fit 完、把最终行列数发过来了。拿调用瞬间的旧值恢复，会把新尺寸盖回去 ——
+// 表现就是换一台分辨率不同的机器打开时，TUI 按小尺寸重绘，画面只占左上角一块。
+// 前后两次都重新读原子变量，谁后写谁生效。
+func (s *Session) Nudge() {
+	if s.proc == nil {
+		return
+	}
+	cols := int(atomic.LoadInt32(&s.cols))
+	rows := int(atomic.LoadInt32(&s.rows))
+	if cols < 3 || rows < 2 {
+		return
+	}
+	_ = s.proc.Resize(cols-1, rows)
+	time.Sleep(80 * time.Millisecond)
+	_ = s.proc.Resize(int(atomic.LoadInt32(&s.cols)), int(atomic.LoadInt32(&s.rows)))
+}
+
 // Kill 结束会话，连同里面跑着的一切。
 //
 // 顺序有讲究：先关 PTY 主设备，让前台进程组收到 SIGHUP（TUI 能借这个信号

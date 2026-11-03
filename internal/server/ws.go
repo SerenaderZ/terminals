@@ -194,11 +194,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// 这里让 PTY 尺寸抖一下：内核会给前台进程组补一个 SIGWINCH，这些程序收到信号
 	// 都会整屏重画，把回放留下的错位字符盖掉。只在备用屏幕里做 —— 普通 shell
 	// 不需要重画，抖了反而会让提示符闪一下。
+	//
+	// 要等一会儿再抖：此刻的 cols/rows 还是"连接建立那一刻"的值，浏览器往往还没
+	// 来得及 fit（拿到的仍是默认的 80x24）。在这上面抖，TUI 会按错尺寸重绘一次，
+	// 之后浏览器发来真实尺寸时抖动已经用完了 —— 用户看到的就是"内容只占左上角
+	// 一块，点一下分屏才铺满"。250ms 足够 fit 完成并把最终尺寸送过来，Nudge 自己
+	// 也会重新读一次当前尺寸，不会把新值盖回去。
 	if inAlt {
 		go func() {
-			_ = sess.Resize(cols-1, rows)
-			time.Sleep(80 * time.Millisecond)
-			_ = sess.Resize(cols, rows)
+			time.Sleep(250 * time.Millisecond)
+			sess.Nudge()
 		}()
 	}
 
