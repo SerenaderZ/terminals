@@ -11,7 +11,9 @@ package/app/bin/tsd
 
 # 测试脚本的依赖与产物（package.json 要入库，clone 后 npm install 才有的装）
 tools/node_modules/
-tools/ui-*.png
+# UI 测试用例跑完落的截图，属于本地调试产物。里面带着本机的地址栏和
+# 用户名，不进仓库；要看效果自己跑一遍就有了。
+tools/*.png
 tmp-layout.json
 tmp-data/
 
