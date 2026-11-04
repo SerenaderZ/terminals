@@ -60,8 +60,10 @@ process.on('exit', cleanup);
     const s = window.__ts.app.activePane().session;
     const b = document.getElementById('banner');
     return {
-      has: s.term.hasSelection(),
-      text: (s.term.getSelection() || '').trim(),
+      // 选区现在由前端自己维护（见 app.js 的 selRange / rangeText），
+      // 不再借 xterm 的选区模型 —— 全屏程序一重绘就会把它清掉。
+      has: !!s.selRange,
+      text: (s.selectionText() || '').trim(),
       banner: b ? b.textContent : '',
       hidden: b ? b.hidden : true,
       alt: s.term.buffer.active.type,
@@ -120,6 +122,33 @@ process.on('exit', cleanup);
   await sleep(500);
   let p1 = await pasted();
   check('紧接着再右键 = 粘贴（同一段内容）', p1.length === 1 && p1[0].trim() === s1.text, JSON.stringify(p1));
+
+  // ---------- 双击选词 / 三击选行 ----------
+  //
+  // 选区改由前端自己维护之后，这两个动作也得自己实现 —— 以前是 xterm
+  // 送的，少了会明显感觉不如以前好用。
+  await page.evaluate(() => {
+    const s = window.__ts.app.activePane().session;
+    s.term.write('\x1b[H\x1b[2J');
+    s.term.write('PLAIN_LINE_ONE\r\nPLAIN_LINE_TWO\r\n');
+  });
+  await sleep(400);
+  const at = await page.evaluate((col, row) => {
+    const s = window.__ts.app.activePane().session;
+    const m = s.cellMetrics();
+    const r = s.host.getBoundingClientRect();
+    return { x: r.x + m.left + (col + 0.5) * m.w, y: r.y + m.top + (row + 0.5) * m.h };
+  }, 3, 0);
+
+  await page.mouse.click(at.x, at.y, { clickCount: 2 });
+  await sleep(300);
+  const dbl = await page.evaluate(() => window.__ts.app.activePane().session.selectionText());
+  check('双击选中整个词', dbl.trim() === 'PLAIN_LINE_ONE', JSON.stringify(dbl));
+
+  await page.mouse.click(at.x, at.y, { clickCount: 3 });
+  await sleep(300);
+  const tri = await page.evaluate(() => window.__ts.app.activePane().session.selectionText());
+  check('三击选中整行', tri.trim() === 'PLAIN_LINE_ONE', JSON.stringify(tri));
 
   // ---------- 全屏程序 + 鼠标追踪 ----------
   await page.evaluate(() => {

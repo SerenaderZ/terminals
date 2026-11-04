@@ -509,14 +509,21 @@
     this.replayCols = 0;
     this.replayAt = 0;
     this.widthFixes = 0;
-    // selLock 是 Shift 拖选期间的选区保护开关，见 installSelectionGuard。
-    this.selLock = false;
-    this.selLockAt = 0;
-    // 选区高亮由我们自己画（见 installSelectionLayer）。xterm 渲染器在
-    // 全屏程序反复重设终端状态时会把那层高亮丢掉，而选区数据还留着 ——
-    // 表现就是"选中的东西消失了，但右键还能复制"。
+    // 选区完全由我们自己维护，不再借用 xterm 的选区模型。
+    //
+    // 为什么：全屏程序（Claude Code / Ink）每一帧都会重设终端状态、并且
+    // 真的会消费鼠标报告，xterm 的选区在这些路径上会被清掉，它画的高亮层
+    // 也会被重绘冲掉 —— 前面几版一直在堵这些窟窿，堵一个冒一个。
+    // 自己的模型只依赖两样东西：鼠标坐标和缓冲区里的文字，程序怎么重绘
+    // 都改不了它。框和文字同时留在手里，右键就不可能再退回粘贴。
+    //
+    //   selRange —— 选中范围（缓冲区绝对行号/列号，结束列不含）
+    //   selDrag  —— 正在拖动时的锚点
+    //   selSnap  —— 上一次选中的文本（复制不再回头问终端要）
     this.selEl = null;
     this.selRange = null;
+    this.selDrag = null;
+    this.selSnap = null;
     this.selPaintRAF = 0;
     this.paintTimer = 0;
     this.widthTimer = 0;
@@ -589,7 +596,6 @@
     }
 
     this.installProtocolGuard();
-    this.installSelectionGuard();
 
     term.onData(function (data) {
       self.send(C.INPUT, new TextEncoder().encode(data));
@@ -634,35 +640,88 @@
 
     host.addEventListener('keydown', function (e) { self.onKeydown(e); }, true);
 
-    // 右键按下的时机要把选区抢下来。
+    // 拖选：整个选区（范围、文字、高亮）都由我们自己算。
     //
-    // 必须放在 capture 阶段、而且是这个处理器里最早的动作：全屏程序开着
-    // 鼠标追踪，这次按下会被 xterm 打包成鼠标报告发给程序，而
-    // `_coreService.onUserInput` 上挂着"有选区就清掉"。等到 contextmenu
-    // 时选区已经没了 —— 实测按下那一刻还有 27 个字符，事件冒到
-    // contextmenu 时是 0。慢一步就只能靠快照，而快照会过期，
-    // 结果就是"屏幕上明明有选框，右键却是粘贴"。
+    // 三种情况分开处理，边界和真实终端一致：
+    //   程序开着鼠标追踪 + 不按 Shift  → 原样交给程序（点按钮、拖滑块都靠它）
+    //   程序开着鼠标追踪 + 按住 Shift  → 我们接管，并且不再传给它
+    //   程序没开鼠标追踪               → 直接拖选，和普通终端一样
     //
-    // 抢下来的文字存进 selSnap，由它决定右键语义（见 selectionText）。
-    // 右键不解锁：锁着才能让 xterm 这一下真的清不掉选区。
+    // 接管时必须 stopPropagation：xterm 收到这些事件会自己再选一遍（多一层
+    // 不可见的高亮），还会把拖动打包成鼠标报告发给程序 —— Claude Code 收到
+    // 后会自己选中、自己 copy、再整屏重绘，把我们的框和程序自己的 UI 全搅在
+    // 一起（它那行 "copied N chars to clipboard" 就是这么来的）。
     host.addEventListener('mousedown', function (e) {
-      if (e.button === 2) {
-        self.captureSelection();
+      if (e.button !== 0) return;
+      var c = self.cellAt(e);
+      if (!c) return;
+      var tracking = self.mouseTracking();
+      var own = !tracking || e.shiftKey;
+      // 双击选词、三击选整行。以前这两个是 xterm 送的，现在选区自己管，
+      // 得自己实现 —— 少了它会明显感觉"不如以前好用"。
+      if (e.detail >= 2) {
+        self.selectToken(c, e.detail);
+        if (own) {
+          e.stopPropagation();
+          e.preventDefault();
+          self.focus();
+        }
         return;
       }
-      //   Shift + 按下  → 上锁，整段拖动都受保护（全屏程序里只能这么选）
-      //   普通按下      → 解锁并作废快照，用户明确要做别的事了
-      if (e.shiftKey) {
-        self.lockSelection();
-      } else {
-        self.selLock = false;
-        self.selSnap = null;
+      if (tracking && !e.shiftKey) {
+        // 程序自己在处理这个拖动：Claude Code 会画它自己的蓝色选框，还会
+        // 打一行 "copied N chars to clipboard"。但在 http 页面上它写不进
+        // 系统剪贴板，那行提示其实是假的 —— 右键粘贴只能粘到上一次的东西。
+        //
+        // 所以照样记一份我们自己的范围，只是**不拦事件**：程序该怎么反应
+        // 还怎么反应，我们只负责"屏幕上看见什么，右键就能复制什么"。
+        self.beginSelection(c, e, false);
+        return;
       }
+      // 按住 Shift（或者在普通终端里直接拖）：这次拖动归我们，
+      // 事件不再往下传 —— 否则程序会自己再选一遍、还会整屏重绘。
+      self.beginSelection(c, e, true);
+      e.stopPropagation();
+      e.preventDefault();
+      self.focus();
     }, true);
-    // 按键同理：光标动过了，之前选中的那一段就不再是"用户刚选的东西"。
-    host.addEventListener('keydown', function () {
-      self.selLock = false;
-      self.selSnap = null;
+
+    // 拖动和松手挂在 window 上：鼠标拖出终端区域时也要继续更新。
+    window.addEventListener('mousemove', function (e) {
+      var d = self.selDrag;
+      if (!d) return;
+      var c = self.cellAt(e);
+      if (!c) return;
+      self.dragSelection(c, e);
+      // 只有"这次拖动归我们"的时候才拦事件。程序自己在处理的那种
+      // （鼠标追踪 + 没按 Shift），必须让它继续收到 mousemove，
+      // 否则它自己的选框、拖拽交互就全断了。
+      if (d.block) e.stopPropagation();
+    }, true);
+
+    window.addEventListener('mouseup', function (e) {
+      var d = self.selDrag;
+      if (!d || e.button !== 0) return;
+      self.endSelection();
+      if (d.block) e.stopPropagation();
+    }, true);
+
+    // 键盘一按，选中的东西就不再是"用户刚选的东西"了：收掉框和快照，
+    // 这样紧接着右键又回到粘贴。放到 window 上，焦点不在终端时也生效。
+    //
+    // 三种情况不处理：
+    //   单独的修饰键 —— 按一下 Shift 准备拖选，不该把上一次的选中也带走
+    //   复制快捷键   —— 那是"要拿走选中的内容"，收掉就没得复制了
+    //   粘贴快捷键   —— 同理
+    window.addEventListener('keydown', function (e) {
+      if (!(self.selRange || self.selSnap)) return;
+      var mod = e.ctrlKey || e.metaKey;
+      if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' ||
+          e.key === 'Meta' || e.key === 'CapsLock') return;
+      if (mod && (e.key === 'Insert' || ((e.key === 'C' || e.key === 'c') && e.shiftKey))) return;
+      if (e.shiftKey && e.key === 'Insert') return;
+      if (mod && (e.key === 'V' || e.key === 'v') && e.shiftKey) return;
+      self.clearSelection();
     }, true);
 
     // 右键的语义按"有没有选中东西"来定，两个动作都只要一次点击：
@@ -711,31 +770,14 @@
       self.focus();
     });
 
-    // 选中即复制。终端里拖选文字，十次有十次是为了粘到别处；
-    // 再要求按一次快捷键就是纯多余 —— 何况 Chrome 把 Ctrl+Shift+C
-    // 给了开发者工具，网页拦不住。默认开，设置页里可以关掉。
-    //
-    // 防抖 160ms：拖选过程中选区每变一次都会触发，不能每变一次就写剪贴板。
-    try {
-      if (term.onSelectionChange) {
-        term.onSelectionChange(function () {
-          // 每次真的选中东西都留一份快照。作用是兜底：哪怕高亮被程序
-          // 后续的输出冲掉（协议重设、清屏重绘），用户几秒内右键仍能
-          // 复制到刚选的那段，而不是撞进"没选区就粘贴"。
-          var sel = self.term && self.term.getSelection();
-          if (sel) self.selSnap = { text: sel, at: Date.now() };
-
-          if (!self.owner || !self.owner.settings.copyOnSelect) return;
-          clearTimeout(self.selTimer);
-          self.selTimer = setTimeout(function () {
-            if (self.disposed || !self.term) return;
-            var text = self.selectionText();
-            if (!text) return;
-            self.copyText(text);
-          }, 160);
-        });
-      }
-    } catch (e) { /* 老版本 xterm 没有这个事件 */ }
+    // 选中即复制（默认开，设置页里可以关）。挪到拖选结束时做 ——
+    // 现在选区由我们自己维护，不再有"选区每变一次就触发一次"的事件，
+    // 拖动过程中也不需要每帧写剪贴板。
+    this.copyOnSelect = function () {
+      if (!self.owner || !self.owner.settings.copyOnSelect) return;
+      var text = self.selectionText();
+      if (text) self.copyText(text);
+    };
 
     // 全屏 TUI（vim/htop/claude）进出备用屏幕时，xterm 会整块换缓冲区。
     // 这一下 WebGL 渲染器偶尔会留下上一次画面的"幽灵字符"（字形图集没刷），
@@ -1052,9 +1094,9 @@
     this.widthTimer = setTimeout(function () {
       self.widthTimer = null;
       if (self.disposed) return;
-      self.selLock = false;
       self.selSnap = null;
       self.selRange = null;
+      self.selDrag = null;
       self.everWrote = false;
       if (self.term) { try { self.term.reset(); } catch (e) { } }
       // 静默断开：这是自愈动作，不该弹"连接已断开"。
@@ -1187,8 +1229,6 @@
         // 换成另一个会话时同理，而且必须更彻底：连 scrollback 一起丢掉，
         // 免得两个会话的历史混在一条回看缓冲里。
         if (self.term && (becameNewSession || info.replayLen > 0 || info.replaySkipped || self.everWrote)) {
-          // 重建屏幕之前必须先放开选区锁，否则 reset 里的清除会被拦下。
-          self.selLock = false;
           self.term.reset();
           self.selSnap = null;
           self.selRange = null;
@@ -1394,43 +1434,6 @@
     } catch (e) { /* 内部结构对不上就不保护了 */ }
   };
 
-  // installSelectionGuard 让"用户刚选中的东西"不被程序的重设动作清掉。
-  //
-  // 这是上一个协议守卫堵不住的漏口：Claude Code（Ink）每一帧都会把终端状态
-  // 重设一遍，其中就包括 `\x1b[?1049h`（重新进入备用屏幕）。xterm 收到它会
-  // 走 onBufferActivate → SelectionService.clearSelection()，选区直接消失 ——
-  // 协议根本没变，但高亮没了，用户来不及右键。
-  //
-  // 与其逐个堵上游（协议、清屏、切缓冲都各有一条路），不如直接守住最末端的
-  // 那个清除入口：xterm 内部所有"非用户意图"的清除最终都落在
-  // SelectionService.clearSelection() 上。
-  //
-  // 锁的边界（重要，放开早了没用、放开晚了会挡住正常操作）：
-  //   上锁：Shift + 按下鼠标（全屏程序里唯一的选择入口），整段拖动过程都锁着
-  //   解锁：用户下一次普通点击、按键盘、或我们自己调用 clearSelection()
-  // 拖动过程中的 setSelection 走的是 SelectionModel，不经过这个入口，
-  // 所以锁着也照样能拖出新选区。
-  Session.prototype.installSelectionGuard = function () {
-    try {
-      var svc = this.term && this.term._core && this.term._core._selectionService;
-      if (!svc || svc.__tsGuarded || typeof svc.clearSelection !== 'function') return;
-      var self = this;
-      var orig = svc.clearSelection.bind(svc);
-      svc.clearSelection = function () {
-        if (self.selLock && Date.now() - (self.selLockAt || 0) < 60000) return;
-        self.selLock = false;
-        return orig();
-      };
-      svc.__tsGuarded = true;
-    } catch (e) { /* 内部结构对不上就放弃，右键还有快照兜底 */ }
-  };
-
-  // lockSelection 在 Shift 拖选期间把选区保护起来。
-  Session.prototype.lockSelection = function () {
-    this.selLock = true;
-    this.selLockAt = Date.now();
-  };
-
   // installSelectionLayer 自己画选区高亮。
   //
   // 为什么不用 xterm 自带的那层：全屏程序（Claude Code / Ink）每一帧都会把
@@ -1491,51 +1494,174 @@
     return { w: w, h: h, left: sr.left - hr.left, top: sr.top - hr.top };
   };
 
+  // mouseTracking 程序此刻是不是在收鼠标事件。
+  //
+  // 收事件的时候不能抢它的拖动（点按钮、拖滑块都靠这些事件），只有按住
+  // Shift 才让给我们 —— 这和 iTerm / GNOME Terminal / Windows Terminal
+  // 的约定一致：全屏程序里按 Shift 才是"我要选文字"。
+  Session.prototype.mouseTracking = function () {
+    try {
+      var m = this.term && this.term.modes && this.term.modes.mouseTrackingMode;
+      return !!m && m !== 'none';
+    } catch (e) { return false; }
+  };
+
+  // cellAt 把鼠标坐标换成缓冲区里的单元格（列 / 绝对行号）。
+  Session.prototype.cellAt = function (e) {
+    var t = this.term, host = this.host;
+    if (!t || !host) return null;
+    var m = this.cellMetrics();
+    if (!m || !(m.w > 0) || !(m.h > 0)) return null;
+    var hr = host.getBoundingClientRect();
+    var x = (e.clientX - hr.left - m.left) / m.w;
+    var y = (e.clientY - hr.top - m.top) / m.h;
+    var buf = t.buffer && t.buffer.active;
+    if (!buf) return null;
+    var col = Math.max(0, Math.min(t.cols, Math.floor(x)));
+    var row = buf.viewportY + Math.max(0, Math.min(t.rows - 1, Math.floor(y)));
+    return { col: col, row: row };
+  };
+
+  // selectToken 双击选一个词、三击选一行。
+  //
+  // 词的定义按"读起来像一段"来：字母数字和下划线算词字符；中文一个字
+  // 就是一个词（一长串中文整体选中反而不好用）；落在标点/空白上时选中
+  // 那一段连续的非空白字符。
+  Session.prototype.selectToken = function (cell, count) {
+    var t = this.term, buf = t && t.buffer && t.buffer.active;
+    if (!buf) return;
+    var line = buf.getLine(cell.row);
+    if (!line) return;
+    var text = line.translateToString(true);
+    var a = Math.min(cell.col, Math.max(0, text.length - 1));
+    var b;
+
+    if (count >= 3) {
+      a = 0;
+      b = text.length;
+    } else if (!text.length) {
+      a = 0;
+      b = 0;
+    } else {
+      var isWord = function (ch) { return !!ch && /[A-Za-z0-9_@#$%&+\-./\\:~]/.test(ch); };
+      var isCJK = function (ch) { return !!ch && ch.charCodeAt(0) >= 0x2e80; };
+      if (isCJK(text[a])) {
+        b = a + 1;
+      } else if (isWord(text[a])) {
+        while (a > 0 && isWord(text[a - 1])) a--;
+        b = a;
+        while (b < text.length && isWord(text[b])) b++;
+      } else {
+        // 标点或空白：选中连续的非空白字符
+        var solid = function (ch) { return !!ch && !/\s/.test(ch); };
+        while (a > 0 && solid(text[a - 1])) a--;
+        b = a;
+        while (b < text.length && solid(text[b])) b++;
+      }
+    }
+
+    this.selDrag = null;
+    this.selRange = { sx: a, sy: cell.row, ex: Math.min(b, t.cols), ey: cell.row };
+    var sel = this.rangeText();
+    if (!sel) { this.clearSelection(); return; }
+    this.selSnap = { text: sel };
+    this.paintSelection();
+    this.copyOnSelect();
+  };
+
+  Session.prototype.beginSelection = function (cell, e, block) {
+    this.selDrag = {
+      anchor: cell, focus: cell, moved: false,
+      x: e ? e.clientX : 0, y: e ? e.clientY : 0,
+      block: !!block,
+    };
+    this.selSnap = null;
+    this.selRange = { sx: cell.col, sy: cell.row, ex: cell.col, ey: cell.row };
+    this.paintSelection();
+  };
+
+  Session.prototype.dragSelection = function (cell, e) {
+    var d = this.selDrag;
+    if (!d) return;
+    // "是拖动还是单击"按像素判断，不按单元格：手抖两下、或者一格里挪了
+    // 半格，都还是单击；真的拖开了才算选中。按单元格判断的话，短距离
+    // 拖动会被当成点击，选区当场被收掉 —— 看起来就是"一松手框就没了"。
+    if (e && (Math.abs(e.clientX - d.x) > 3 || Math.abs(e.clientY - d.y) > 3)) d.moved = true;
+    if (cell.col !== d.focus.col || cell.row !== d.focus.row) d.moved = true;
+    d.focus = cell;
+    this.setRangeFromDrag();
+    this.paintSelection();
+  };
+
+  // setRangeFromDrag 把锚点和当前点规整成"左上 → 右下、结束列不含"的范围。
+  // 反着拖（右往左、下往上）全靠这一步归一。
+  Session.prototype.setRangeFromDrag = function () {
+    var d = this.selDrag;
+    if (!d) return;
+    var a = d.anchor, f = d.focus;
+    var backwards = (f.row < a.row) || (f.row === a.row && f.col < a.col);
+    var s = backwards ? f : a;
+    var e = backwards ? a : f;
+    var cols = this.term ? this.term.cols : e.col + 1;
+    this.selRange = {
+      sx: s.col, sy: s.row,
+      ex: Math.min(e.col + 1, cols), ey: e.row,
+    };
+  };
+
+  Session.prototype.endSelection = function () {
+    var d = this.selDrag;
+    this.selDrag = null;
+    if (!d) return;
+    if (!d.moved) {
+      // 只是点了一下，没有拖动 —— 不算选中。
+      this.clearSelection();
+      return;
+    }
+    var text = this.rangeText();
+    if (!text) { this.clearSelection(); return; }
+    this.selSnap = { text: text };
+    this.paintSelection();
+    this.copyOnSelect();
+  };
+
+  // rangeText 直接按范围从缓冲区里取字。
+  //
+  // 不经过 xterm 的选区服务：那玩意儿会被全屏程序的重绘清掉，而且清掉的
+  // 时机完全不可预测。缓冲区里的文字才是唯一可靠的来源。
+  Session.prototype.rangeText = function () {
+    var t = this.term, r = this.selRange;
+    if (!t || !r) return '';
+    var buf = t.buffer && t.buffer.active;
+    if (!buf) return '';
+    var out = [];
+    for (var y = r.sy; y <= r.ey; y++) {
+      var line = buf.getLine(y);
+      if (!line) continue;
+      var a = (y === r.sy) ? r.sx : 0;
+      var b = (y === r.ey) ? r.ex : t.cols;
+      out.push(line.translateToString(true, a, b));
+    }
+    // 行尾空白是终端补的，复制出来只会碍事。
+    return out.join('\n').replace(/\s+$/, '');
+  };
+
   Session.prototype.paintSelection = function () {
-    var el = this.selEl, t = this.term;
+    var el = this.selEl;
     if (!el) return;
     try {
-      this.paintSelectionInner(el, t);
+      this.paintSelectionInner(el);
     } catch (e) {
-      // 画不出来就退回 xterm 自带的高亮，不能什么都不显示。
-      this.selEl = null;
-      try {
-        el.remove();
-        var th = this.term && this.term.options && this.term.options.theme;
-        if (th) {
-          var copy = {};
-          for (var k in th) copy[k] = th[k];
-          copy.selectionBackground = 'rgba(76,194,255,0.3)';
-          copy.selectionInactiveBackground = 'rgba(76,194,255,0.3)';
-          this.term.options.theme = copy;
-        }
-      } catch (e2) { }
+      // 画不出来也不能把这一层拆了：拆了以后就再也没有高亮可画。
+      // 清空内容即可，下次重绘再试。
+      try { el.textContent = ''; } catch (e2) { }
     }
   };
 
-  Session.prototype.paintSelectionInner = function (el, t) {
-    if (!t) { el.textContent = ''; return; }
-
-    var pos = null;
-    try {
-      if (t.hasSelection && t.hasSelection() && t.getSelectionPosition) {
-        pos = t.getSelectionPosition();
-      }
-    } catch (e) { pos = null; }
-
-    if (pos && pos.start && pos.end) {
-      this.selRange = { sx: pos.start.x, sy: pos.start.y, ex: pos.end.x, ey: pos.end.y };
-    } else if (!(this.selLock && this.selRange)) {
-      // 锁着的时候保留上一份范围：某些清除路径绕过守卫时，高亮也不该闪。
-      this.selRange = null;
-      // 框已经没了，快照也没有意义 —— 留着会让"其实什么都没选中"的右键
-      // 复制到一段旧文字，用户看到的却不是粘贴。
-      if (!this.selLock) this.selSnap = null;
-    }
-
+  Session.prototype.paintSelectionInner = function (el) {
+    var t = this.term, r = this.selRange;
     el.textContent = '';
-    var r = this.selRange;
-    if (!r) return;
+    if (!t || !r) return;
 
     var buf = t.buffer && t.buffer.active;
     if (!buf) return;
@@ -1564,41 +1690,28 @@
 
   // selectionText 返回"这次右键该复制的内容"。
   //
-  // 先看活选区；活选区已经被清掉时用快照。快照的有效期不靠时间判断，而是
-  // "用户有没有做别的事"：
-  //   - 普通左键按下（在别处点了一下）
-  //   - 按了键盘
+  // 范围还在就现取（缓冲区可能已经变了，现取最准）；范围没了就用上次的
+  // 快照。快照什么时候作废由用户行为决定，不按时间：
+  //   - 在别处点了左键（非 Shift）、按了键盘
   //   - 我们自己复制完主动收掉
-  //   - 画面上已经没有选框了（见 paintSelectionInner）
-  // 这几件事才会作废它。
-  //
-  // 为什么不用固定时长：全屏程序每帧都在重绘，xterm 侧的选区随时可能被清，
-  // 屏幕上那层选框却是我们自己画的、一直留着。用户看到框还在、慢慢读上
-  // 二三十秒再右键，按时间判断就刚好过期 —— 表现就是"明明选着，右键却是
-  // 粘贴"。框在就该能复制，这才是唯一说得通的规则。
+  // 之所以不设有效期：框和文字都在我们手里，程序重绘动不了它们。
+  // 以前按 15 秒过期，用户慢慢读一会儿再右键就变成粘贴。
   Session.prototype.selectionText = function () {
-    if (!this.term) return '';
-    var now = this.term.getSelection();
-    if (now) return now;
+    if (this.selRange) {
+      var live = this.rangeText();
+      if (live) return live;
+    }
     return this.selSnap ? this.selSnap.text : '';
   };
 
-  // captureSelection 把当前活选区抓成快照。右键按下时立刻调用 ——
-  // 那是选区还存在的最后时刻。
-  Session.prototype.captureSelection = function () {
-    if (!this.term) return;
-    var now = '';
-    try { now = this.term.getSelection() || ''; } catch (e) { now = ''; }
-    if (now) this.selSnap = { text: now, at: Date.now() };
-  };
-
-  // clearSelection 连同快照一起作废 —— 复制完就走这条路，
+  // clearSelection 把框、范围、快照一起收掉 —— 复制完就走这条路，
   // 于是紧接着的下一次右键必然是粘贴。
   Session.prototype.clearSelection = function () {
     this.selSnap = null;
     this.selRange = null;
-    // 先解锁，否则会被 installSelectionGuard 拦下来，清不掉。
-    this.selLock = false;
+    this.selDrag = null;
+    // xterm 自己那份选区也清掉：虽然不用它，但留着会让浏览器原生复制
+    // （Ctrl+C 在非终端焦点时）拿到不一致的内容。
     try { if (this.term) this.term.clearSelection(); } catch (e) { }
     this.paintSelection();
   };

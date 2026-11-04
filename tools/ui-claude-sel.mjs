@@ -92,7 +92,7 @@ process.on('exit', cleanup);
 
   const immediately = await page.evaluate(() => {
     const s = window.__ts.app.activePane().session;
-    return { has: s.term.hasSelection(), text: (s.term.getSelection() || '').trim() };
+    return { has: !!s.selRange, text: (s.selectionText() || '').trim() };
   });
   check('Shift 拖动后立刻有选区', immediately.has && immediately.text.length > 0, JSON.stringify(immediately.text.slice(0, 40)));
 
@@ -101,7 +101,7 @@ process.on('exit', cleanup);
 
   const later = await page.evaluate(() => {
     const s = window.__ts.app.activePane().session;
-    return { has: s.term.hasSelection(), text: (s.term.getSelection() || '').trim() };
+    return { has: !!s.selRange, text: (s.selectionText() || '').trim() };
   });
   check('持续重绘 1.5 秒后选区仍在', later.has && later.text.length > 0, `has=${later.has} text=${JSON.stringify(later.text.slice(0, 40))}`);
 
@@ -112,7 +112,8 @@ process.on('exit', cleanup);
   // 这里直接比几何：第一块色块必须正好从选区起始列开始、宽到结束列。
   const overlay = await page.evaluate(() => {
     const s = window.__ts.app.activePane().session;
-    const pos = s.term.getSelectionPosition();
+    const r = s.selRange;
+    const pos = { start: { x: r.sx, y: r.sy }, end: { x: r.ex, y: r.ey } };
     const m = s.cellMetrics();
     const rects = Array.from(document.querySelectorAll('.ts-sel div')).map((d) => ({
       l: parseFloat(d.style.left), t: parseFloat(d.style.top),
@@ -163,25 +164,31 @@ process.on('exit', cleanup);
   const afterCopy = await page.evaluate(() => ({ pasted: window.__pasted, copied: window.__copied }));
   check('复制之后再右键是粘贴', afterCopy.pasted > 0, JSON.stringify(afterCopy));
 
-  // 选完过了很久才右键，仍然要复制。
+  // 反向拖选（从右下往左上）：范围要归一化，多行文字要按行拼对。
   //
-  // 旧实现按 15 秒时间戳判断快照有效期：全屏程序每帧重绘会把 xterm 侧的
-  // 选区清掉，屏幕上的选框却是我们自己画的、一直留着 —— 用户看着框还在，
-  // 慢慢读上二三十秒再右键，就刚好过期，落到粘贴。这里直接把时间戳往回拨
-  // 两分钟来覆盖那条时间判断。
+  // 这条是新实现的边界：选区不再借 xterm，范围由我们自己算 —— 方向反着拖
+  // 是最容易算歪的一种。
   await arm();
-  await dragSelect(60);
-  const rewound = await page.evaluate(() => {
-    const s = window.__ts.app.activePane().session;
-    if (!s.selSnap) return false;
-    s.selSnap.at = Date.now() - 120000;
-    return true;
-  });
-  check('选区快照存在（可回拨时间戳）', rewound);
-  await page.mouse.click(box.x + 320, box.y + 60, { button: 'right' });
+  await page.keyboard.down('Shift');
+  await page.mouse.move(box.x + 320, box.y + 70);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 12, box.y + 34, { steps: 10 });
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
   await sleep(300);
-  const stale = await page.evaluate(() => ({ pasted: window.__pasted, copied: window.__copied }));
-  check('等很久再右键仍然是复制', !!stale.copied && stale.pasted === 0, JSON.stringify(stale).slice(0, 80));
+  const rev = await page.evaluate(() => {
+    const s = window.__ts.app.activePane().session;
+    return { text: s.selectionText(), r: s.selRange };
+  });
+  check('反向拖选能选中', !!rev.text && rev.text.length > 0, JSON.stringify(rev.text.slice(0, 30)));
+  check('反向拖选的范围是归一化的（左上 → 右下）',
+    !!rev.r && rev.r.sy <= rev.r.ey && (rev.r.sy !== rev.r.ey || rev.r.sx < rev.r.ex),
+    JSON.stringify(rev.r));
+  check('多行选区按行拼出来', rev.text.split('\n').length >= 2, `${rev.text.split('\n').length} 行`);
+  await page.mouse.click(box.x + 320, box.y + 70, { button: 'right' });
+  await sleep(300);
+  const revCopy = await page.evaluate(() => window.__copied);
+  check('反向拖选后右键能复制', !!revCopy && revCopy.length > 0, JSON.stringify(String(revCopy || '').slice(0, 30)));
 
   // 选完又在别处点了一下（普通左键）—— 已经不是在选东西了，右键该粘贴。
   await arm();

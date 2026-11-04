@@ -133,7 +133,8 @@ const bufText = (page) => page.evaluate(() => {
   await sleep(400);
   const sel = await pB.evaluate(() => {
     const s = window.__ts.app.activePane().session;
-    return { has: s.term.hasSelection(), text: (s.term.getSelection() || '').trim() };
+    // 选区由前端自己维护（selRange + rangeText），不再借 xterm 的选区模型。
+    return { has: !!s.selRange, text: (s.selectionText() || '').trim() };
   });
   check('Shift 拖动可以选中', sel.has && sel.text.length > 0, JSON.stringify(sel.text.slice(0, 30)));
 
