@@ -66,8 +66,24 @@ const bufText = (page) => page.evaluate(() => {
   const beforeCount = before.split('REPLAY_MARKER_ONE').length - 1;
   check('命令回显与输出都在屏幕上', beforeCount >= 2, `出现 ${beforeCount} 次`);
 
+  const ptyBefore = await page.evaluate(async () => {
+    const s = window.__ts.app.activePane().session;
+    const r = await fetch('/api/sessions').then((x) => x.json());
+    const me = (r.data || []).find((x) => x.sid === s.sid) || {};
+    return me.cols + 'x' + me.rows;
+  });
+
   await page.evaluate(() => window.__ts.app.activePane().session.retryNow());
   await sleep(3000);
+
+  const ptyAfter = await page.evaluate(async () => {
+    const s = window.__ts.app.activePane().session;
+    const r = await fetch('/api/sessions').then((x) => x.json());
+    const me = (r.data || []).find((x) => x.sid === s.sid) || {};
+    return me.cols + 'x' + me.rows;
+  });
+  // 尺寸被踩一次就多一次 SIGWINCH，Ink 会把历史重印一遍。重连不该扰动它。
+  check('重连没有扰动 PTY 尺寸', ptyBefore === ptyAfter, `${ptyBefore} → ${ptyAfter}`);
 
   const after = await bufText(page);
   const afterCount = after.split('REPLAY_MARKER_ONE').length - 1;

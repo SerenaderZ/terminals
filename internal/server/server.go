@@ -3,10 +3,13 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"terminals/internal/config"
@@ -67,7 +70,48 @@ func (s *Server) routes() {
 
 	// 静态资源：http.FileServerFS 自带路径穿越防护（会拒绝 ..），
 	// 不需要自己拼路径。
-	s.mux.Handle("/", http.FileServerFS(ui.FS))
+	s.mux.Handle("/", s.staticUI())
+}
+
+// staticUI 提供前端资源，顺手解决升级后浏览器仍在跑旧代码的问题。
+//
+// 两个坑叠在一起：
+//
+//  1. 前端是 go:embed 进二进制的，embed.FS 的文件修改时间是零值，Go 的
+//     FileServer 因此不发 Last-Modified、不发 ETag。浏览器拿不到任何校验
+//     凭据，就按启发式规则自己决定缓存多久 —— 升级完打开页面，跑的还是
+//     上一版 app.js。用户看到的就是"明明更新了，bug 还在"。
+//  2. 老版本被缓存下来之后，光加 Cache-Control 也追不回来：那份响应的头
+//     是旧的。所以要换 URL —— index.html 里的 __V__ 每次都会替换成当前
+//     版本号，升级后 app.js?v=0.2.15 是一个浏览器从没见过的地址。
+//
+// 顺带一提：版本号取自 session.Version，与 READY 帧里报的是同一个值，
+// 排查时可以拿它和设置页显示的版本对账。
+func (s *Server) staticUI() http.Handler {
+	files := http.FileServerFS(ui.FS)
+	index, err := ui.FS.ReadFile("index.html")
+	ver := url.QueryEscape(session.Version)
+	if err == nil {
+		index = bytes.ReplaceAll(index, []byte("__V__"), []byte(ver))
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// no-cache：可以存，但每次都要回源确认。局域网里多跑一次请求，
+		// 换来的是"升级即生效"，值。
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			if err != nil {
+				http.Error(w, "index.html missing", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Length", strconv.Itoa(len(index)))
+			_, _ = w.Write(index)
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
 }
 
 // basePath 把网关前缀从请求路径上剥掉。

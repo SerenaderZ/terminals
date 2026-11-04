@@ -487,6 +487,16 @@
     // 全屏 TUI 就会在错误宽度上排版 —— 退出时留在屏幕上的就是错位残字。
     this.ptyCols = 0;
     this.ptyRows = 0;
+    // everWrote 记录"这一格屏幕上曾经落过东西"。重连时只要它为真，就必须
+    // 先清屏再灌回放 —— 单看服务端是否带回放不够，回放为空的情形下同样是
+    // 旧画面摞新画面。
+    this.everWrote = false;
+    // fitted 表示 term 的行列数是按真实 DOM 布局算出来的。没 fit 之前
+    // 它只是 xterm 的默认 80x24，任何"报给服务端"的动作都必须先看这个。
+    this.fitted = false;
+    // selLock 是 Shift 拖选期间的选区保护开关，见 installSelectionGuard。
+    this.selLock = false;
+    this.selLockAt = 0;
     // 滚轮增量的余量，攒够 40px 走一行（触摸板的小增量靠它才滚得动）。
     this.wheelAcc = 0;
     // 最近一次连接失败的原因与关闭码。状态栏那个按钮的悬停说明全靠它，
@@ -554,6 +564,7 @@
     }
 
     this.installProtocolGuard();
+    this.installSelectionGuard();
 
     term.onData(function (data) {
       self.send(C.INPUT, new TextEncoder().encode(data));
@@ -586,6 +597,17 @@
     window.addEventListener('resize', function () { self.scheduleFit(); });
 
     host.addEventListener('keydown', function (e) { self.onKeydown(e); }, true);
+
+    // 选区锁的两个开关。放在 capture 阶段，比 xterm 自己的 mousedown
+    // 处理器更早跑，避免"程序先清了、我们后锁"的顺序问题。
+    //
+    //   Shift + 按下  → 上锁，整段拖动都受保护（全屏程序里只能这么选）
+    //   普通按下/按键 → 解锁，用户明确要做别的事了
+    host.addEventListener('mousedown', function (e) {
+      if (e.shiftKey) self.lockSelection();
+      else self.selLock = false;
+    }, true);
+    host.addEventListener('keydown', function () { self.selLock = false; }, true);
 
     // 右键的语义按"有没有选中东西"来定，两个动作都只要一次点击：
     //   有选区 → 复制（用户刚拖完文字，想做的一定是拿走它）
@@ -901,6 +923,9 @@
     if (!this.term || !this.fitAddon || !this.host) return;
     if (this.host.clientWidth === 0 || this.host.clientHeight === 0) return;
     try { this.fitAddon.fit(); } catch (e) { return; }
+    // fitted 一旦为真，说明 term.cols/rows 是真实布局算出来的，可以拿去
+    // 和 PTY 对账；在此之前它们只是 xterm 的默认 80x24。
+    this.fitted = true;
   };
 
   // resize 防抖：拖窗口时别把 PTY 刷爆，TUI 会跟着反复重排。
@@ -921,6 +946,10 @@
   Session.prototype.connect = function () {
     if (this.disposed) return;
     var self = this;
+    // 建连前先把行列数算准。URL 里的 cols/rows 会用来创建新会话，晚一步
+    // 就是拿默认的 80x24 去开 PTY：shell 先按 80 列起一屏，紧接着 fit 完
+    // 再改成真实宽度 —— 多出来一次 SIGWINCH，全屏程序会因此重排重印。
+    this.fit();
     this.connectAt = Date.now();
     this.setState('connecting');
 
@@ -950,7 +979,9 @@
       self.lastError = '';
       self.lastCode = 0;
       self.setState('online');
-      if (self.term) self.sendResize(self.term.cols, self.term.rows);
+      // 同理：只有 fit 过才报尺寸。没 fit 时报上去的是默认 80x24，
+      // 服务端照着改一次 PTY 就多一次 SIGWINCH。
+      if (self.term && self.fitted) self.sendResize(self.term.cols, self.term.rows);
     };
 
     ws.onmessage = function (ev) {
@@ -960,7 +991,10 @@
       var payload = buf.subarray(1);
 
       if (kind === S.OUTPUT) {
-        if (self.term) self.term.write(payload);
+        if (self.term) {
+          self.term.write(payload);
+          self.everWrote = true;
+        }
         return;
       }
 
@@ -979,7 +1013,9 @@
         //
         // 换成另一个会话时同理，而且必须更彻底：连 scrollback 一起丢掉，
         // 免得两个会话的历史混在一条回看缓冲里。
-        if (self.term && (info.replayLen > 0 || becameNewSession)) {
+        if (self.term && (becameNewSession || info.replayLen > 0 || self.everWrote)) {
+          // 重建屏幕之前必须先放开选区锁，否则 reset 里的清除会被拦下。
+          self.selLock = false;
           self.term.reset();
           self.selSnap = null;
           self.alt = false;
@@ -994,7 +1030,10 @@
         // 不指望"下一次窗口 resize 会顺带修正"。
         self.ptyCols = info.cols || 0;
         self.ptyRows = info.rows || 0;
-        if (self.term && self.ptyCols && self.ptyRows &&
+        // 只在自己真的 fit 过之后才对账。没 fit 时 term.cols/rows 还是
+        // xterm 的默认值，拿它去改 PTY 等于主动把终端踩成 80x24 ——
+        // 之后 fit 完再改回来，两次 SIGWINCH，全屏程序会把历史重印两遍。
+        if (self.fitted && self.term && self.ptyCols && self.ptyRows &&
             (self.ptyCols !== self.term.cols || self.ptyRows !== self.term.rows)) {
           self.sendResize(self.term.cols, self.term.rows);
         }
@@ -1164,7 +1203,44 @@
     } catch (e) { /* 内部结构对不上就不保护了 */ }
   };
 
-  // 快照的有效期。正常路径上用不到它（协议保护会保住高亮），它是给
+  // installSelectionGuard 让"用户刚选中的东西"不被程序的重设动作清掉。
+  //
+  // 这是上一个协议守卫堵不住的漏口：Claude Code（Ink）每一帧都会把终端状态
+  // 重设一遍，其中就包括 `\x1b[?1049h`（重新进入备用屏幕）。xterm 收到它会
+  // 走 onBufferActivate → SelectionService.clearSelection()，选区直接消失 ——
+  // 协议根本没变，但高亮没了，用户来不及右键。
+  //
+  // 与其逐个堵上游（协议、清屏、切缓冲都各有一条路），不如直接守住最末端的
+  // 那个清除入口：xterm 内部所有"非用户意图"的清除最终都落在
+  // SelectionService.clearSelection() 上。
+  //
+  // 锁的边界（重要，放开早了没用、放开晚了会挡住正常操作）：
+  //   上锁：Shift + 按下鼠标（全屏程序里唯一的选择入口），整段拖动过程都锁着
+  //   解锁：用户下一次普通点击、按键盘、或我们自己调用 clearSelection()
+  // 拖动过程中的 setSelection 走的是 SelectionModel，不经过这个入口，
+  // 所以锁着也照样能拖出新选区。
+  Session.prototype.installSelectionGuard = function () {
+    try {
+      var svc = this.term && this.term._core && this.term._core._selectionService;
+      if (!svc || svc.__tsGuarded || typeof svc.clearSelection !== 'function') return;
+      var self = this;
+      var orig = svc.clearSelection.bind(svc);
+      svc.clearSelection = function () {
+        if (self.selLock && Date.now() - (self.selLockAt || 0) < 60000) return;
+        self.selLock = false;
+        return orig();
+      };
+      svc.__tsGuarded = true;
+    } catch (e) { /* 内部结构对不上就放弃，右键还有快照兜底 */ }
+  };
+
+  // lockSelection 在 Shift 拖选期间把选区保护起来。
+  Session.prototype.lockSelection = function () {
+    this.selLock = true;
+    this.selLockAt = Date.now();
+  };
+
+  // 快照的有效期。正常路径上用不到它（选区锁会保住高亮），它是给
   // "高亮已经消失、但用户确实刚选过"这种情况兜底的。太长会误伤 ——
   // 用户选完过一会儿想粘贴，却被当成又一次复制。
   var SEL_SNAP_TTL = 15000;
@@ -1183,6 +1259,8 @@
   // 于是紧接着的下一次右键必然是粘贴。
   Session.prototype.clearSelection = function () {
     this.selSnap = null;
+    // 先解锁，否则会被 installSelectionGuard 拦下来，清不掉。
+    this.selLock = false;
     try { if (this.term) this.term.clearSelection(); } catch (e) { }
   };
 
