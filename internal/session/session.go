@@ -49,6 +49,11 @@ type Ready struct {
 	// ReplayTruncated 表示回放的开头被环形缓冲覆盖掉了，起点落在半截
 	// 序列上。前端收到 true 时必须整屏重建，不能试图接着旧内容往下写。
 	ReplayTruncated bool `json:"replayTruncated"`
+
+	// ReplaySkipped 表示这次挂载**故意没给回放**：缓冲里的历史是在另一个
+	// 列数下写的，按现在的宽度灌回去只会得到一屏叠字。前端清屏后等程序
+	// 自己重画（Resize 会补一个 SIGWINCH）。
+	ReplaySkipped bool `json:"replaySkipped"`
 }
 
 // Info 是会话列表里的一项。
@@ -137,6 +142,23 @@ type Session struct {
 	seq     uint64
 
 	ring *Ring
+
+	// 回放缓冲里的字节是在哪个宽度下产生的。
+	//
+	// 终端输出是字节流：同一段字节按 120 列解析和按 100 列解析，画出来是
+	// 两幅完全不同的画面。readline / Ink 这些程序重画一行靠的是 "\r + 光标
+	// 移动 + 擦除"，宽度一变，这些定位就全落到错的地方 —— 屏幕上出现的是
+	// 两行字叠在一起的乱码，而不是"排版变了"。
+	//
+	// 所以这里记两件事：写缓冲时的列数（replayCols），以及这个列数是从
+	// 第几个字节开始生效的（replayMark）。挂载客户端时只回放同一列数下
+	// 写出来的那段；列数对不上就干脆不回放，让程序自己重画。
+	//
+	// 只有 readLoop 一个 goroutine 会写，Attach 会读，用 replayMu 护住。
+	replayMu   sync.Mutex
+	replayCols int32
+	replayMark int64
+	written    int64
 
 	altMu sync.Mutex
 	alt   altScanner
@@ -261,6 +283,7 @@ func (s *Session) readLoop() {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 
+			s.noteWidth(n)
 			_, _ = s.ring.Write(chunk)
 
 			s.altMu.Lock()
@@ -336,13 +359,49 @@ func (s *Session) finish(code int) {
 	close(s.done)
 }
 
+// noteWidth 在把一块输出写进回放缓冲**之前**调用，记下这块字节是在哪个
+// 列数下产生的。列数变了就把"有效起点"挪到当前写入位置 —— 之前的字节
+// 都是按旧宽度排的版，不能和新宽度的混着回放。
+func (s *Session) noteWidth(n int) {
+	cols := atomic.LoadInt32(&s.cols)
+	s.replayMu.Lock()
+	if cols != s.replayCols {
+		s.replayCols = cols
+		s.replayMark = s.written
+	}
+	s.written += int64(n)
+	s.replayMu.Unlock()
+}
+
 // Attach 挂载一个客户端，返回客户端句柄和需要回放的输出。
 //
-// truncated 表示回放缓冲已经写满过、开头被覆盖 —— 前端拿到这种回放必须先
-// 把屏幕清干净再灌，否则旧画面会和回放叠在一起。
-func (s *Session) Attach() (c *Client, replay []byte, inAlt, needAltEnter, truncated bool) {
+// truncated 表示回放的开头可能是半截字节（环形缓冲绕回了，或者被下面的
+// 宽度裁剪切掉了）—— 前端拿到这种回放必须先清屏、并把起点对齐到安全位置。
+//
+// ok 为 false 表示"这段历史没法回放"：客户端现在的列数和写这段字节时的
+// 列数对不上。这时候回放过去只会得到一屏叠在一起的乱字，不如不回放 ——
+// 调用方随后会让 PTY 按新尺寸 Resize，内核补一个 SIGWINCH，全屏程序整屏
+// 重绘，shell 也会重画提示符。
+func (s *Session) Attach(cols int) (c *Client, replay []byte, inAlt, needAltEnter, truncated, ok bool) {
 	payload := s.ring.Snapshot()
 	truncated = s.ring.Truncated()
+
+	// 只保留"当前列数这一档"写出来的尾巴。回放缓冲里可能留着切换过宽度
+	// 之前的旧字节，那段按现在的宽度解析就是错位。
+	s.replayMu.Lock()
+	mark, width, written := s.replayMark, int(s.replayCols), s.written
+	s.replayMu.Unlock()
+
+	if tail := written - mark; tail >= 0 && tail < int64(len(payload)) {
+		payload = payload[int64(len(payload))-tail:]
+		truncated = true
+	}
+	// width 为 0 表示还没有任何输出（刚起会话），没有可回放的东西。
+	ok = cols <= 0 || width == 0 || width == cols
+	if !ok {
+		payload = nil
+		truncated = false
+	}
 
 	s.altMu.Lock()
 	inAlt = s.alt.InAlt()
@@ -359,7 +418,7 @@ func (s *Session) Attach() (c *Client, replay []byte, inAlt, needAltEnter, trunc
 	s.clients[c.ID] = c
 	s.mu.Unlock()
 
-	return c, payload, inAlt, needAltEnter, truncated
+	return c, payload, inAlt, needAltEnter, truncated, ok
 }
 
 // Detach 解绑一个客户端。挂载守卫保证无论任务如何结束都会调用。
@@ -471,7 +530,7 @@ func (s *Session) ClientCount() int {
 }
 
 // Ready 组装发给前端的就绪信息。
-func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated bool) Ready {
+func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated, skipped bool) Ready {
 	return Ready{
 		SID:             s.ID,
 		Shell:           s.Shell,
@@ -484,6 +543,7 @@ func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated bool)
 		Version:         s.cfg.Version,
 		ReplayLen:       replayLen,
 		ReplayTruncated: truncated,
+		ReplaySkipped:   skipped,
 	}
 }
 

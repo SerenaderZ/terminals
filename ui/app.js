@@ -65,7 +65,10 @@
     foreground: '#1f1f1f',
     cursor: '#1f1f1f',
     cursorAccent: '#ffffff',
-    selectionBackground: 'rgba(0,103,192,0.25)'
+    // 选区底色由我们自己画（installSelectionLayer），这里必须是全透明 ——
+    // 两层都画的话叠起来会明显偏深，看着像选中了两次。
+    selectionBackground: 'rgba(0,0,0,0)',
+    selectionInactiveBackground: 'rgba(0,0,0,0)'
   };
 
   var DARK_THEME = {
@@ -73,7 +76,9 @@
     foreground: '#cccccc',
     cursor: '#cccccc',
     cursorAccent: '#0c0c0c',
-    selectionBackground: 'rgba(76,194,255,0.3)',
+    // 同上：选区底色自己画，这里留空。
+    selectionBackground: 'rgba(0,0,0,0)',
+    selectionInactiveBackground: 'rgba(0,0,0,0)',
     black: '#0c0c0c',
     red: '#e5534b',
     green: '#3fb950',
@@ -494,9 +499,28 @@
     // fitted 表示 term 的行列数是按真实 DOM 布局算出来的。没 fit 之前
     // 它只是 xterm 的默认 80x24，任何"报给服务端"的动作都必须先看这个。
     this.fitted = false;
+    // 布局稳定之前不建连。见 waitLayout。
+    this.layoutReady = false;
+    this.layoutCols = 0;
+    this.waiters = null;
+    // 回放是在哪个列数下灌进去的。灌完这一屏如果再变宽度，xterm 会把整屏
+    // 重新折行，readline/Ink 那种"光标定位重画"的字节就会落到错的地方 ——
+    // 屏幕上留一堆重叠的乱字。真遇上这种情况宁可重连一次，按新宽度重新灌。
+    this.replayCols = 0;
+    this.replayAt = 0;
+    this.widthFixes = 0;
     // selLock 是 Shift 拖选期间的选区保护开关，见 installSelectionGuard。
     this.selLock = false;
     this.selLockAt = 0;
+    // 选区高亮由我们自己画（见 installSelectionLayer）。xterm 渲染器在
+    // 全屏程序反复重设终端状态时会把那层高亮丢掉，而选区数据还留着 ——
+    // 表现就是"选中的东西消失了，但右键还能复制"。
+    this.selEl = null;
+    this.selRange = null;
+    this.selPaintRAF = 0;
+    this.paintTimer = 0;
+    this.widthTimer = 0;
+    this.replayPainted = false;
     // 滚轮增量的余量，攒够 40px 走一行（触摸板的小增量靠它才滚得动）。
     this.wheelAcc = 0;
     // 最近一次连接失败的原因与关闭码。状态栏那个按钮的悬停说明全靠它，
@@ -540,6 +564,7 @@
     term.open(host);
     this.term = term;
     this.fitAddon = fit;
+    this.installSelectionLayer(host);
 
     // Ctrl+V 不能同时当"终端按键"和"浏览器粘贴"。
     //
@@ -581,6 +606,17 @@
     });
 
     term.onResize(function (size) {
+      // 回放刚灌完就变宽度：这一屏是按旧列数折的行，xterm 会整屏重折，
+      // 那些靠光标定位重画的字节就落到错的位置，屏幕上留下重叠的乱字。
+      // 与其让它斑驳着，不如重连一次、按新宽度重新灌一遍（只做一次，
+      // 避免尺寸本身在抖的时候来回重连）。
+      if (self.replayCols && size.cols !== self.replayCols &&
+          Date.now() - self.replayAt < 4000 && self.widthFixes < 1) {
+        self.widthFixes += 1;
+        self.replayCols = 0;
+        self.reloadForWidth();
+        return;
+      }
       self.sendResize(size.cols, size.rows);
       self.opts.onScroll && self.opts.onScroll();
     });
@@ -922,7 +958,10 @@
   Session.prototype.fit = function () {
     if (!this.term || !this.fitAddon || !this.host) return;
     if (this.host.clientWidth === 0 || this.host.clientHeight === 0) return;
+    var before = this.term.cols + 'x' + this.term.rows;
     try { this.fitAddon.fit(); } catch (e) { return; }
+    // 行列数一变，字符格的位置和大小全变了，自己画的那层选区要跟着挪。
+    if (this.term.cols + 'x' + this.term.rows !== before) this.paintSelection();
     // fitted 一旦为真，说明 term.cols/rows 是真实布局算出来的，可以拿去
     // 和 PTY 对账；在此之前它们只是 xterm 的默认 80x24。
     this.fitted = true;
@@ -933,6 +972,97 @@
     var self = this;
     clearTimeout(this.resizeTimer);
     this.resizeTimer = setTimeout(function () { self.fit(); }, 80);
+  };
+
+  // waitLayout 等到窗格真的有尺寸、而且连续两次量到同一个列数，再放行建连。
+  //
+  // 为什么是"连续两次"：字体、滚动条、flex 布局生效的那一帧量出来的宽度
+  // 常常还是旧的。只量一次就建连，回放就会按错宽度解析，之后布局定型再
+  // 重新折行 —— 屏幕上就是顶部那一片叠字。
+  //
+  // 隐藏的窗格（别的标签页里的）会一直等到它被显示出来：那时
+  // ResizeObserver 会触发，列数一稳定就自己连上。这比"先按 80x24 连上，
+  // 之后再把 PTY 掰回来"干净得多。
+  Session.prototype.waitLayout = function () {
+    var self = this;
+    if (this.waiters) { this.waiters.push(1); return; }
+    this.waiters = [1];
+
+    var finish = function () {
+      if (self.layoutReady) return;
+      self.layoutReady = true;
+      self.waiters = null;
+      self.connect();
+    };
+
+    var tries = 0;
+    var tick = function () {
+      if (self.disposed) { self.waiters = null; return; }
+      if (self.ws || self.layoutReady) { self.waiters = null; return; }
+      var host = self.host;
+      if (host && host.clientWidth > 0 && host.clientHeight > 0) {
+        self.fit();
+        var cols = self.term ? self.term.cols : 0;
+        if (cols > 0 && cols === self.layoutCols) { finish(); return; }
+        self.layoutCols = cols;
+      }
+      // 前两秒密一点（正常的页面一帧就定了），之后退到 250ms 一轮：
+      // 藏在别的标签页里的窗格会等很久，没必要一直每 60ms 去摸一次布局。
+      tries += 1;
+      setTimeout(tick, tries < 34 ? 60 : 250);
+    };
+
+    // 字体就绪之后再量：字体还没落地时 xterm 量到的字宽是 fallback 字体的，
+    // 列数会偏大。没有 Font Loading API 就直接开始。
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(tick, tick);
+    } else {
+      tick();
+    }
+  };
+
+  // reloadForWidth 把"按旧宽度排好的一屏"丢掉，重连后按新宽度重新灌。
+  //
+  // 只在回放刚落地就变宽度时调用（见 onResize）。这是唯一能保住画面正确
+  // 的做法：xterm 的折行对普通文本没问题，但 readline / Ink 那种靠光标
+  // 定位重画的内容折一次就散了。
+  Session.prototype.reloadForWidth = function () {
+    var self = this;
+    if (this.widthTimer) return;
+    this.widthTimer = setTimeout(function () {
+      self.widthTimer = null;
+      if (self.disposed) return;
+      self.selLock = false;
+      self.selSnap = null;
+      self.selRange = null;
+      self.everWrote = false;
+      if (self.term) { try { self.term.reset(); } catch (e) { } }
+      // 静默断开：这是自愈动作，不该弹"连接已断开"。
+      self.quietClose = true;
+      self.retry = 0;
+      if (self.ws) { try { self.ws.close(); } catch (e) { } }
+    }, 250);
+  };
+
+  // paintAll 整屏重画，顺带刷掉 WebGL 的字形图集。
+  //
+  // 灌完回放之后必须来一发：回放是一大段字节，xterm 按脏区增量绘制，
+  // 没被新内容覆盖到的行会留着上一次连接的字形像素 —— 用户看到的就是
+  // "顶部几行是上一次的残影"。
+  Session.prototype.paintAll = function () {
+    var self = this;
+    if (!this.term) return;
+    var paint = function () {
+      if (self.disposed || !self.term) return;
+      if (self.webgl && typeof self.webgl.clearTextureAtlas === 'function') {
+        try { self.webgl.clearTextureAtlas(); } catch (e) { }
+      }
+      try { self.term.refresh(0, self.term.rows - 1); } catch (e) { }
+      self.paintSelection();
+    };
+    requestAnimationFrame(paint);
+    clearTimeout(this.paintTimer);
+    this.paintTimer = setTimeout(paint, 140);
   };
 
   Session.prototype.setFontSize = function (size) {
@@ -946,6 +1076,19 @@
   Session.prototype.connect = function () {
     if (this.disposed) return;
     var self = this;
+
+    // 布局没稳定之前不建连 —— 这一条是"关掉网页再打开，顶部一片乱字"的
+    // 正解。
+    //
+    // 页面刚起来时窗格可能还没被排版（藏在别的标签页里、flex 还没算完），
+    // fit() 量出来的列数是错的，甚至量不到（xterm 停在默认 80x24）。这时
+    // 建连、灌回放，等于让终端按错的宽度解析一整段历史；等布局真正生效，
+    // xterm 会把整屏重新折行 —— readline / Ink 那些靠 "\r + 光标移动"
+    // 重画的字节就落到错位置，屏幕顶部留下两行叠在一起的乱码。
+    //
+    // 所以先等到"连续两次量到同一个列数"，再连。
+    if (!this.layoutReady) { this.waitLayout(); return; }
+
     // 建连前先把行列数算准。URL 里的 cols/rows 会用来创建新会话，晚一步
     // 就是拿默认的 80x24 去开 PTY：shell 先按 80 列起一屏，紧接着 fit 完
     // 再改成真实宽度 —— 多出来一次 SIGWINCH，全屏程序会因此重排重印。
@@ -994,6 +1137,16 @@
         if (self.term) {
           self.term.write(payload);
           self.everWrote = true;
+          // 回放这一大段落地后整屏重画一次。
+          //
+          // xterm 按脏区增量绘制：回放把内容写到下半屏，上半屏没有新内容、
+          // 就不会被重画，于是留着上一次连接的字符像素 —— 用户看到的是
+          // "关掉网页再打开，顶部几行是上一次的残影、还叠着新内容"。
+          // 清字形图集 + 整屏 refresh 是唯一确定有效的收尾。
+          if (self.replayCols && !self.replayPainted) {
+            self.replayPainted = true;
+            self.paintAll();
+          }
         }
         return;
       }
@@ -1013,16 +1166,25 @@
         //
         // 换成另一个会话时同理，而且必须更彻底：连 scrollback 一起丢掉，
         // 免得两个会话的历史混在一条回看缓冲里。
-        if (self.term && (becameNewSession || info.replayLen > 0 || self.everWrote)) {
+        if (self.term && (becameNewSession || info.replayLen > 0 || info.replaySkipped || self.everWrote)) {
           // 重建屏幕之前必须先放开选区锁，否则 reset 里的清除会被拦下。
           self.selLock = false;
           self.term.reset();
           self.selSnap = null;
+          self.selRange = null;
+          self.paintSelection();
           self.alt = false;
           self.opts.onAlt && self.opts.onAlt(false);
         }
         if (becameNewSession) self.exited = false;
         self.sid = info.sid;
+
+        // 记下这一屏回放是按多少列灌进去的。灌完立刻变宽度的话（布局迟到、
+        // 用户拖窗口），xterm 会整屏重折，靠光标定位重画的字节就散了 ——
+        // 那种情况宁可重连按新宽度重灌，见 onResize 里的 reloadForWidth。
+        self.replayCols = info.replayLen > 0 && self.term ? self.term.cols : 0;
+        self.replayAt = Date.now();
+        self.replayPainted = false;
 
         // 尺寸对账：READY 里的 cols/rows 是 PTY 当前的真实大小。
         // 一旦它和 xterm 不一致，TUI 就按错宽度排版、换行位置全错，
@@ -1046,6 +1208,9 @@
             self.term.write('\x1b[?1049h');
           }
         }
+        // 留一份最近的 READY：排障时能直接看出服务端给了多少回放、
+        // 是不是按"宽度对不上"跳过了回放。
+        self.lastReady = info;
         self.opts.onReady && self.opts.onReady(info);
         return;
       }
@@ -1086,13 +1251,19 @@
     ws.onclose = function (ev) {
       self.ws = null;
       if (self.disposed) return;
-      self.fail(closeReason(ev), ev && ev.code);
-      self.setState('offline');
+      // quietClose 是我们自己为了重排而断的（见 reloadForWidth）：
+      // 不是故障，别弹"连接已断开"吓人。
+      var quiet = self.quietClose;
+      self.quietClose = false;
+      if (!quiet) {
+        self.fail(closeReason(ev), ev && ev.code);
+        self.setState('offline');
+      }
       // 1013 = 服务端主动放弃这条连接（输出太快，队列跟不上）。
       // 这不是故障，是"重连一下就好"：清掉退避计数，别让用户对着
       // 一个已经过去的问题等 1s、2s、4s。
       if (ev && ev.code === 1013) self.retry = 0;
-      if (!self.exited) self.scheduleRetry(ev && ev.code === 1013);
+      if (!self.exited) self.scheduleRetry(quiet || (ev && ev.code === 1013));
     };
   };
 
@@ -1240,6 +1411,134 @@
     this.selLockAt = Date.now();
   };
 
+  // installSelectionLayer 自己画选区高亮。
+  //
+  // 为什么不用 xterm 自带的那层：全屏程序（Claude Code / Ink）每一帧都会把
+  // 终端状态重设一遍 —— 重设鼠标协议、重进备用屏幕、切光标模式。xterm 的
+  // 渲染器在这条路上会把"高亮层"丢掉：选区数据还在（右键照样能复制），
+  // 但屏幕上没有那层底色。用户看到的就是"按住 Shift 拖动，高亮自己没了"，
+  // 而我们在模型层面无论怎么验证都是"有选区"。
+  //
+  // 所以干脆自己画：在终端容器上盖一层绝对定位的 div，按选区范围摆色块。
+  // 它跟 xterm 内部实现完全无关，程序怎么重绘都冲不掉；位置在每次重绘、
+  // 滚动、改尺寸时重算，滚动历史时也跟着走。
+  //
+  // 代价是 xterm 自带的选择底色必须关掉（theme 里那两项置成全透明），
+  // 否则两层叠在一起会明显偏深。
+  Session.prototype.installSelectionLayer = function (host) {
+    var self = this;
+    try {
+      var el = document.createElement('div');
+      el.className = 'ts-sel';
+      host.appendChild(el);
+      this.selEl = el;
+    } catch (e) {
+      this.selEl = null;
+      return;
+    }
+
+    var schedule = function () {
+      if (self.selPaintRAF) return;
+      self.selPaintRAF = requestAnimationFrame(function () {
+        self.selPaintRAF = 0;
+        self.paintSelection();
+      });
+    };
+    try { this.term.onSelectionChange(schedule); } catch (e) { }
+    try { this.term.onScroll(schedule); } catch (e) { }
+    try { this.term.onResize(schedule); } catch (e) { }
+    try { this.term.onWriteParsed(schedule); } catch (e) { }
+  };
+
+  // cellMetrics 量出"一个字符格"在宿主元素里的位置和大小。
+  // 每次重画都重新量：改字号不一定改行列数，缓存会拿到旧的字高。
+  Session.prototype.cellMetrics = function () {
+    var t = this.term, host = this.host;
+    if (!t || !host || !t.element) return null;
+    var scr = t.element.querySelector('.xterm-screen');
+    if (!scr) return null;
+    var sr = scr.getBoundingClientRect();
+    var hr = host.getBoundingClientRect();
+    var w = t.cols ? sr.width / t.cols : 0;
+    var h = t.rows ? sr.height / t.rows : 0;
+    try {
+      var dims = t._core && t._core._renderService && t._core._renderService.dimensions;
+      if (dims && dims.css && dims.css.cell && dims.css.cell.width > 0) {
+        w = dims.css.cell.width;
+        h = dims.css.cell.height;
+      }
+    } catch (e) { }
+    return { w: w, h: h, left: sr.left - hr.left, top: sr.top - hr.top };
+  };
+
+  Session.prototype.paintSelection = function () {
+    var el = this.selEl, t = this.term;
+    if (!el) return;
+    try {
+      this.paintSelectionInner(el, t);
+    } catch (e) {
+      // 画不出来就退回 xterm 自带的高亮，不能什么都不显示。
+      this.selEl = null;
+      try {
+        el.remove();
+        var th = this.term && this.term.options && this.term.options.theme;
+        if (th) {
+          var copy = {};
+          for (var k in th) copy[k] = th[k];
+          copy.selectionBackground = 'rgba(76,194,255,0.3)';
+          copy.selectionInactiveBackground = 'rgba(76,194,255,0.3)';
+          this.term.options.theme = copy;
+        }
+      } catch (e2) { }
+    }
+  };
+
+  Session.prototype.paintSelectionInner = function (el, t) {
+    if (!t) { el.textContent = ''; return; }
+
+    var pos = null;
+    try {
+      if (t.hasSelection && t.hasSelection() && t.getSelectionPosition) {
+        pos = t.getSelectionPosition();
+      }
+    } catch (e) { pos = null; }
+
+    if (pos && pos.start && pos.end) {
+      this.selRange = { sx: pos.start.x, sy: pos.start.y, ex: pos.end.x, ey: pos.end.y };
+    } else if (!(this.selLock && this.selRange)) {
+      // 锁着的时候保留上一份范围：某些清除路径绕过守卫时，高亮也不该闪。
+      this.selRange = null;
+    }
+
+    el.textContent = '';
+    var r = this.selRange;
+    if (!r) return;
+
+    var buf = t.buffer && t.buffer.active;
+    if (!buf) return;
+    var vp = buf.viewportY;
+    var top = Math.max(r.sy, vp);
+    var bottom = Math.min(r.ey, vp + t.rows - 1);
+    if (bottom < top) return;
+
+    var m = this.cellMetrics();
+    if (!m || !(m.w > 0) || !(m.h > 0)) return;
+
+    var frag = document.createDocumentFragment();
+    for (var y = top; y <= bottom; y++) {
+      var x0 = y === r.sy ? r.sx : 0;
+      var x1 = y === r.ey ? r.ex : t.cols;
+      if (x1 <= x0) continue;
+      var d = document.createElement('div');
+      d.style.left = (m.left + x0 * m.w) + 'px';
+      d.style.top = (m.top + (y - vp) * m.h) + 'px';
+      d.style.width = ((x1 - x0) * m.w) + 'px';
+      d.style.height = m.h + 'px';
+      frag.appendChild(d);
+    }
+    el.appendChild(frag);
+  };
+
   // 快照的有效期。正常路径上用不到它（选区锁会保住高亮），它是给
   // "高亮已经消失、但用户确实刚选过"这种情况兜底的。太长会误伤 ——
   // 用户选完过一会儿想粘贴，却被当成又一次复制。
@@ -1251,7 +1550,9 @@
     if (!this.term) return '';
     var now = this.term.getSelection();
     if (now) return now;
-    if (this.selSnap && Date.now() - this.selSnap.at < SEL_SNAP_TTL) return this.selSnap.text;
+    if (!this.selSnap) return '';
+    // 锁着的时候不过期：用户可能就在半屏程序里慢慢看，过一会儿才右键。
+    if (this.selLock || Date.now() - this.selSnap.at < SEL_SNAP_TTL) return this.selSnap.text;
     return '';
   };
 
@@ -1259,9 +1560,11 @@
   // 于是紧接着的下一次右键必然是粘贴。
   Session.prototype.clearSelection = function () {
     this.selSnap = null;
+    this.selRange = null;
     // 先解锁，否则会被 installSelectionGuard 拦下来，清不掉。
     this.selLock = false;
     try { if (this.term) this.term.clearSelection(); } catch (e) { }
+    this.paintSelection();
   };
 
   // copy 复制当前选区（快捷键走这里），返回是否真的复制到了东西。

@@ -105,6 +105,30 @@ process.on('exit', cleanup);
   });
   check('持续重绘 1.5 秒后选区仍在', later.has && later.text.length > 0, `has=${later.has} text=${JSON.stringify(later.text.slice(0, 40))}`);
 
+  // 高亮是不是真的画出来了。
+  //
+  // 这条是给"选区数据还在、屏幕上却没有蓝底"那个 bug 的回归：xterm 自带的
+  // 高亮层会被全屏程序的重绘冲掉，所以现在由 installSelectionLayer 自己画。
+  // 这里直接比几何：第一块色块必须正好从选区起始列开始、宽到结束列。
+  const overlay = await page.evaluate(() => {
+    const s = window.__ts.app.activePane().session;
+    const pos = s.term.getSelectionPosition();
+    const m = s.cellMetrics();
+    const rects = Array.from(document.querySelectorAll('.ts-sel div')).map((d) => ({
+      l: parseFloat(d.style.left), t: parseFloat(d.style.top),
+      w: parseFloat(d.style.width), h: parseFloat(d.style.height),
+    }));
+    return { pos, m, rects };
+  });
+  const first = overlay.rects[0];
+  const wantLeft = overlay.m.left + overlay.pos.start.x * overlay.m.w;
+  const wantWidth = (overlay.pos.end.x - overlay.pos.start.x) * overlay.m.w;
+  check('选区高亮真的画出来了', overlay.rects.length > 0,
+    `${overlay.rects.length} 块`);
+  check('高亮的起点和宽度对得上选区',
+    !!first && Math.abs(first.l - wantLeft) < 1.5 && Math.abs(first.w - wantWidth) < 2,
+    first ? `left=${first.l} (期望 ${wantLeft}) width=${first.w} (期望 ${wantWidth})` : '没有色块');
+
   // 用户能不能直接右键复制
   await page.evaluate(() => {
     const s = window.__ts.app.activePane().session;

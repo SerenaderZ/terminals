@@ -335,6 +335,8 @@ body.resizing { cursor: col-resize; }
   /* flex 里不要给 width:100% —— 右侧还有一条轨道，100% 会把轨道挤出可视区。
      基准设 0、靠 grow 吃掉剩余宽度，xterm 量到的就是真实可用宽度。 */
   flex: 1 1 0;
+  /* 自绘的选区层按它定位（见 installSelectionLayer）。 */
+  position: relative;
   width: auto;
   height: 100%;
   min-width: 0;
@@ -950,3 +952,23 @@ html[data-theme="light"] .btn.primary { color: #fff; }
   border-color: var(--danger);
 }
 .btn.danger:hover { background: rgba(229, 83, 75, 0.12); }
+
+/* 选区高亮层。xterm 自带的那层在半屏程序持续重绘时会被丢掉，所以由
+   installSelectionLayer 自己按选区范围摆色块 —— 这一层和终端内容无关，
+   程序怎么重绘都冲不掉。 */
+.ts-sel {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ts-sel div {
+  position: absolute;
+  background: rgba(76, 194, 255, 0.28);
+}
+
+html[data-theme="light"] .ts-sel div {
+  background: rgba(0, 103, 192, 0.22);
+}

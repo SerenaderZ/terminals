@@ -170,13 +170,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, replay, inAlt, needAltEnter, truncated := sess.Attach()
+	client, replay, inAlt, needAltEnter, truncated, replayOK := sess.Attach(cols)
 	defer sess.Detach(client)
 
+	// 宽度对不上时 Attach 会故意不给回放：那段历史是在另一个列数下写的，
+	// 按现在的宽度灌回去只会得到一屏叠字。这里告诉前端"没有回放"，它清屏
+	// 之后等程序自己重画 —— 前端发现 READY 的 cols 和 xterm 不一致会补一次
+	// Resize，内核下发 SIGWINCH，全屏程序整屏重绘，shell 也会重画提示符。
+	//
 	// READY 必须在回放之前发：前端要先知道 sid 和是否在备用屏幕。
 	// replayLen 一起带上，前端据此在灌回放之前把屏幕清干净 —— 不清的话
 	// 重连后旧画面会和新回放叠成一团重影。
-	readyJSON, _ := json.Marshal(sess.Ready(inAlt, needAltEnter, len(replay), truncated))
+	readyJSON, _ := json.Marshal(sess.Ready(inAlt, needAltEnter, len(replay), truncated, !replayOK))
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := conn.WriteMessage(websocket.BinaryMessage, proto.Frame(proto.KindReady, readyJSON)); err != nil {
 		return
