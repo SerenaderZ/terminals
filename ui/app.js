@@ -634,16 +634,36 @@
 
     host.addEventListener('keydown', function (e) { self.onKeydown(e); }, true);
 
-    // 选区锁的两个开关。放在 capture 阶段，比 xterm 自己的 mousedown
-    // 处理器更早跑，避免"程序先清了、我们后锁"的顺序问题。
+    // 右键按下的时机要把选区抢下来。
     //
-    //   Shift + 按下  → 上锁，整段拖动都受保护（全屏程序里只能这么选）
-    //   普通按下/按键 → 解锁，用户明确要做别的事了
+    // 必须放在 capture 阶段、而且是这个处理器里最早的动作：全屏程序开着
+    // 鼠标追踪，这次按下会被 xterm 打包成鼠标报告发给程序，而
+    // `_coreService.onUserInput` 上挂着"有选区就清掉"。等到 contextmenu
+    // 时选区已经没了 —— 实测按下那一刻还有 27 个字符，事件冒到
+    // contextmenu 时是 0。慢一步就只能靠快照，而快照会过期，
+    // 结果就是"屏幕上明明有选框，右键却是粘贴"。
+    //
+    // 抢下来的文字存进 selSnap，由它决定右键语义（见 selectionText）。
+    // 右键不解锁：锁着才能让 xterm 这一下真的清不掉选区。
     host.addEventListener('mousedown', function (e) {
-      if (e.shiftKey) self.lockSelection();
-      else self.selLock = false;
+      if (e.button === 2) {
+        self.captureSelection();
+        return;
+      }
+      //   Shift + 按下  → 上锁，整段拖动都受保护（全屏程序里只能这么选）
+      //   普通按下      → 解锁并作废快照，用户明确要做别的事了
+      if (e.shiftKey) {
+        self.lockSelection();
+      } else {
+        self.selLock = false;
+        self.selSnap = null;
+      }
     }, true);
-    host.addEventListener('keydown', function () { self.selLock = false; }, true);
+    // 按键同理：光标动过了，之前选中的那一段就不再是"用户刚选的东西"。
+    host.addEventListener('keydown', function () {
+      self.selLock = false;
+      self.selSnap = null;
+    }, true);
 
     // 右键的语义按"有没有选中东西"来定，两个动作都只要一次点击：
     //   有选区 → 复制（用户刚拖完文字，想做的一定是拿走它）
@@ -1508,6 +1528,9 @@
     } else if (!(this.selLock && this.selRange)) {
       // 锁着的时候保留上一份范围：某些清除路径绕过守卫时，高亮也不该闪。
       this.selRange = null;
+      // 框已经没了，快照也没有意义 —— 留着会让"其实什么都没选中"的右键
+      // 复制到一段旧文字，用户看到的却不是粘贴。
+      if (!this.selLock) this.selSnap = null;
     }
 
     el.textContent = '';
@@ -1539,21 +1562,34 @@
     el.appendChild(frag);
   };
 
-  // 快照的有效期。正常路径上用不到它（选区锁会保住高亮），它是给
-  // "高亮已经消失、但用户确实刚选过"这种情况兜底的。太长会误伤 ——
-  // 用户选完过一会儿想粘贴，却被当成又一次复制。
-  var SEL_SNAP_TTL = 15000;
-
-  // selectionText 返回"这次右键该复制的内容"：优先当前真实选区，
-  // 退回到 15 秒内的选区快照。
+  // selectionText 返回"这次右键该复制的内容"。
+  //
+  // 先看活选区；活选区已经被清掉时用快照。快照的有效期不靠时间判断，而是
+  // "用户有没有做别的事"：
+  //   - 普通左键按下（在别处点了一下）
+  //   - 按了键盘
+  //   - 我们自己复制完主动收掉
+  //   - 画面上已经没有选框了（见 paintSelectionInner）
+  // 这几件事才会作废它。
+  //
+  // 为什么不用固定时长：全屏程序每帧都在重绘，xterm 侧的选区随时可能被清，
+  // 屏幕上那层选框却是我们自己画的、一直留着。用户看到框还在、慢慢读上
+  // 二三十秒再右键，按时间判断就刚好过期 —— 表现就是"明明选着，右键却是
+  // 粘贴"。框在就该能复制，这才是唯一说得通的规则。
   Session.prototype.selectionText = function () {
     if (!this.term) return '';
     var now = this.term.getSelection();
     if (now) return now;
-    if (!this.selSnap) return '';
-    // 锁着的时候不过期：用户可能就在半屏程序里慢慢看，过一会儿才右键。
-    if (this.selLock || Date.now() - this.selSnap.at < SEL_SNAP_TTL) return this.selSnap.text;
-    return '';
+    return this.selSnap ? this.selSnap.text : '';
+  };
+
+  // captureSelection 把当前活选区抓成快照。右键按下时立刻调用 ——
+  // 那是选区还存在的最后时刻。
+  Session.prototype.captureSelection = function () {
+    if (!this.term) return;
+    var now = '';
+    try { now = this.term.getSelection() || ''; } catch (e) { now = ''; }
+    if (now) this.selSnap = { text: now, at: Date.now() };
   };
 
   // clearSelection 连同快照一起作废 —— 复制完就走这条路，

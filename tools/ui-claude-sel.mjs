@@ -130,15 +130,68 @@ process.on('exit', cleanup);
     first ? `left=${first.l} (期望 ${wantLeft}) width=${first.w} (期望 ${wantWidth})` : '没有色块');
 
   // 用户能不能直接右键复制
-  await page.evaluate(() => {
+  const arm = () => page.evaluate(() => {
     const s = window.__ts.app.activePane().session;
     window.__copied = null;
+    window.__pasted = 0;
     s.copyText = function (t) { window.__copied = t; };
+    s.paste = function () { window.__pasted += 1; };
+    s.pasteInner = function () { window.__pasted += 1; return true; };
   });
+  const dragSelect = async (y) => {
+    await page.keyboard.down('Shift');
+    await page.mouse.move(box.x + 12, box.y + y);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 320, box.y + y, { steps: 8 });
+    await page.mouse.up();
+    await page.keyboard.up('Shift');
+    await sleep(250);
+  };
+
+  await arm();
   await page.mouse.click(box.x + 320, box.y + 34, { button: 'right' });
   await sleep(300);
   const copied = await page.evaluate(() => window.__copied);
   check('重绘之后右键仍能复制', !!copied && copied.length > 0, JSON.stringify(String(copied || '').slice(0, 40)));
+
+  // 复制完紧接着再右键 —— 必须变成粘贴。
+  //
+  // 这是"复制完还要继续用鼠标"的那条路：如果复制之后选区没被收掉，
+  // 用户会一直复制，永远粘不上。
+  await page.mouse.click(box.x + 320, box.y + 34, { button: 'right' });
+  await sleep(300);
+  const afterCopy = await page.evaluate(() => ({ pasted: window.__pasted, copied: window.__copied }));
+  check('复制之后再右键是粘贴', afterCopy.pasted > 0, JSON.stringify(afterCopy));
+
+  // 选完过了很久才右键，仍然要复制。
+  //
+  // 旧实现按 15 秒时间戳判断快照有效期：全屏程序每帧重绘会把 xterm 侧的
+  // 选区清掉，屏幕上的选框却是我们自己画的、一直留着 —— 用户看着框还在，
+  // 慢慢读上二三十秒再右键，就刚好过期，落到粘贴。这里直接把时间戳往回拨
+  // 两分钟来覆盖那条时间判断。
+  await arm();
+  await dragSelect(60);
+  const rewound = await page.evaluate(() => {
+    const s = window.__ts.app.activePane().session;
+    if (!s.selSnap) return false;
+    s.selSnap.at = Date.now() - 120000;
+    return true;
+  });
+  check('选区快照存在（可回拨时间戳）', rewound);
+  await page.mouse.click(box.x + 320, box.y + 60, { button: 'right' });
+  await sleep(300);
+  const stale = await page.evaluate(() => ({ pasted: window.__pasted, copied: window.__copied }));
+  check('等很久再右键仍然是复制', !!stale.copied && stale.pasted === 0, JSON.stringify(stale).slice(0, 80));
+
+  // 选完又在别处点了一下（普通左键）—— 已经不是在选东西了，右键该粘贴。
+  await arm();
+  await dragSelect(90);
+  await page.mouse.click(box.x + 200, box.y + 200);
+  await sleep(250);
+  await page.mouse.click(box.x + 320, box.y + 90, { button: 'right' });
+  await sleep(300);
+  const clickedAway = await page.evaluate(() => ({ pasted: window.__pasted, copied: window.__copied }));
+  check('点过别处之后右键是粘贴', clickedAway.pasted > 0, JSON.stringify(clickedAway).slice(0, 80));
 
   await page.evaluate(() => clearInterval(window.__tuiTimer));
   console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
