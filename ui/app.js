@@ -536,6 +536,19 @@
     this.paintTimer = 0;
     this.widthTimer = 0;
     this.replayPainted = false;
+    // 回放期间不要把终端的"自动应答"发回 PTY。
+    //
+    // 回放是把历史输出重演一遍，而历史里可能有程序当初发出的查询序列
+    // （DA：ESC[c、DSR：ESC[6n 之类）。xterm 不知道这是重演，会按规矩
+    // 应答，应答经 onData 走 INPUT 送进 PTY —— bash 收到就是一串
+    // "1;2c: command not found"。这就是"每次重连都冒乱码"的来源。
+    //
+    // replayPending 是 READY 里 replayLen 的余额，按到达的字节数递减；
+    // 减到 0 的那一帧写完后解锁。replaying 期间用户按键也会被丢掉，
+    // 但回放只有几十毫秒，比收到半段历史再执行强得多。
+    this.replaying = false;
+    this.replayPending = 0;
+    this.replayTimer = 0;
     // 滚轮增量的余量，攒够 40px 走一行（触摸板的小增量靠它才滚得动）。
     this.wheelAcc = 0;
     // 最近一次连接失败的原因与关闭码。状态栏那个按钮的悬停说明全靠它，
@@ -606,10 +619,14 @@
     this.installProtocolGuard();
 
     term.onData(function (data) {
+      // 回放历史时不外发：那里面可能有程序当年发的 DA/DSR 查询，
+      // xterm 的自动应答会顺着这条路进到 PTY，被 shell 当成命令执行。
+      if (self.replaying) return;
       self.send(C.INPUT, new TextEncoder().encode(data));
     });
 
     term.onBinary(function (data) {
+      if (self.replaying) return;
       var bytes = new Uint8Array(data.length);
       for (var i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
       self.send(C.INPUT, bytes);
@@ -1205,7 +1222,28 @@
 
       if (kind === S.OUTPUT) {
         if (self.term) {
-          self.term.write(payload);
+          if (self.replayPending > 0) {
+            // 这一段属于回放：写的时候屏蔽自动应答，写完最后一段再解锁。
+            self.replayPending -= payload.length;
+            self.replaying = true;
+            clearTimeout(self.replayTimer);
+            // 兜底：服务端少发一段、或长度对不上时别把键盘永久锁死。
+            self.replayTimer = setTimeout(function () {
+              self.replaying = false;
+              self.replayPending = 0;
+            }, 3000);
+            if (self.replayPending <= 0) {
+              self.replayPending = 0;
+              self.term.write(payload, function () {
+                self.replaying = false;
+                clearTimeout(self.replayTimer);
+              });
+            } else {
+              self.term.write(payload);
+            }
+          } else {
+            self.term.write(payload);
+          }
           self.everWrote = true;
           // 回放这一大段落地后整屏重画一次。
           //
@@ -1253,6 +1291,9 @@
         self.replayCols = info.replayLen > 0 && self.term ? self.term.cols : 0;
         self.replayAt = Date.now();
         self.replayPainted = false;
+        // 接下来的这一段字节是重演历史，不是程序的新输出（见 ON_DATA 的守卫）。
+        self.replayPending = info.replayLen || 0;
+        self.replaying = false;
 
         // 尺寸对账：READY 里的 cols/rows 是 PTY 当前的真实大小。
         // 一旦它和 xterm 不一致，TUI 就按错宽度排版、换行位置全错，
