@@ -262,7 +262,15 @@
       },
       // 全屏标记跟着"这一格是否被全屏程序占着"走，而不是跟着"最后一次连接
       // 时的状态"走 —— 否则切到别的窗格、或者 vim 退出，标记都会停在原地。
-      onAlt: function (on) { self.setAlt(on); }
+      onAlt: function (on) { self.setAlt(on); },
+      // 终端自己接管的拖动会把 mousedown 就地 stopPropagation（不然 xterm
+      // 和里面的程序会重复选一遍），事件因此传不到本 pane 的 mousedown 监听，
+      // 蓝框就永远停在原来那一格 —— 分屏后点另一个窗格，它还是"没被选中"。
+      // 所以接管的时候得自己喊一声，把焦点和蓝框一起带过来。
+      onGrab: function () {
+        if (!self.focused || self.ws.activePane() !== self) self.ws.focusPane(self);
+        else self.session.focus();
+      }
     });
 
     this.session.mountSection(this.host);
@@ -664,7 +672,7 @@
         if (own) {
           e.stopPropagation();
           e.preventDefault();
-          self.focus();
+          self.grab();
         }
         return;
       }
@@ -683,7 +691,7 @@
       self.beginSelection(c, e, true);
       e.stopPropagation();
       e.preventDefault();
-      self.focus();
+      self.grab();
     }, true);
 
     // 拖动和松手挂在 window 上：鼠标拖出终端区域时也要继续更新。
@@ -1402,6 +1410,13 @@
     // 焦点过来时补挂 WebGL：之前可能因为池满或藏在别的标签里没挂上。
     this.attachWebgl();
     if (this.term) this.term.focus();
+  };
+
+  // grab = "用户点了这一格"。拖选接管时事件被 stopPropagation 掉了，
+  // 外层 pane 收不到 mousedown，只能由终端主动上报（见 Pane.mount 的 onGrab）。
+  Session.prototype.grab = function () {
+    if (this.opts.onGrab) this.opts.onGrab();
+    else this.focus();
   };
 
   // installProtocolGuard 堵住 xterm 的一个小疏漏：重复设置同一个鼠标协议
