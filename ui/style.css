@@ -847,6 +847,12 @@ html[data-theme="light"] .pane .pane-thumb.dragging { background: #9a9a9a; }
 .hist-del:focus-visible { opacity: 1; }
 .hist-del:hover { background: var(--border); color: var(--fg); }
 
+/* 触摸屏上没有 hover，按钮永远等不到 :hover —— 那样等于没有删除功能。
+   干脆常显，也让"点这里删"这件事一眼看得出来。 */
+@media (hover: none) and (pointer: coarse) {
+  .hist-del { opacity: 0.7; }
+}
+
 .hist-empty {
   padding: 26px 14px;
   color: var(--fg-dim);
