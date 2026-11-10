@@ -1928,9 +1928,15 @@
       if (!line) continue;
       var a = (y === r.sy) ? r.sx : 0;
       var b = (y === r.ey) ? r.ex : t.cols;
-      out.push(line.translateToString(true, a, b));
+      // 行尾空白是终端补的，复制出来只会碍事 —— 而且必须是**每一行**都裁。
+      //
+      // xterm 的 translateToString(true) 只把 U+0020 当空格裁，别的空白
+      // （U+00A0 不换行空格、U+3000 全角空格）原样留着。全屏 TUI 正好爱用
+      // 它们把每行补满整宽：复制出来每行后面拖着上百个不可见字符，粘到
+      // 会折行的地方（Claude Code 的输入框）就每行折出一个"空行" ——
+      // 三行文本粘出来变五行。宽文本框里看不出来，所以只在某一处复发。
+      out.push(line.translateToString(true, a, b).replace(/[\s\u200b\ufeff]+$/, ''));
     }
-    // 行尾空白是终端补的，复制出来只会碍事。
     return out.join('\n').replace(/\s+$/, '');
   };
 
