@@ -160,7 +160,8 @@ try {
     st.pasteInner = function () { window.__pasted++; return true; };
     return new Promise((res) => setTimeout(() => res(window.__pasted), 0));
   });
-  await page.mouse.click(paneBox.x, paneBox.y, { button: 'right' });
+  // 点窗格中部：左上角是边框和滚动条轨道的交界，右键事件到不了终端。
+  await page.mouse.click(paneBox.x + paneBox.w * 0.5, paneBox.y + paneBox.h * 0.6, { button: 'right' });
   await sleep(400);
   const afterCtx = await page.evaluate(() => {
     const st = window.__ts.app.activePane().session;

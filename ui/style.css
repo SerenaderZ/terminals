@@ -120,6 +120,27 @@ body {
   flex: 1;
 }
 
+/* 双击标签后替换掉 .title 的输入框。
+   .title 是 flex:1 / basis 0，标签平时就停在 min-width 120px，编辑时给宽一点，
+   否则输入框里只看得到六七个字。改完移除类名，宽度自己回去。 */
+.tab.renaming {
+  min-width: 200px;
+}
+
+.tab .tab-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  line-height: 1.2;
+  padding: 1px 4px;
+  outline: none;
+  user-select: text;
+}
+
 .tab .close {
   border: 0;
   background: transparent;

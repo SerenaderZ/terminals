@@ -2165,16 +2165,120 @@
 
   // ------------------------------------------------------------------ Tab
 
+  // maxTabName 是自定义标签名的长度上限。
+  //
+  // 标签最宽 220px、字号 12px，再长就只剩"..."了。真正的全名在悬停提示里，
+  // 所以这里只挡一个离谱的长字符串（粘一整条命令进来那种），不必精确到像素。
+  var maxTabName = 40;
+
   function Tab(ws, spec) {
     this.ws = ws;
     this.id = spec.id || uid('t');
     this.title = spec.title || '终端';
+    // custom 是用户双击标签改的名字。空字符串表示"没改过，跟着终端标题走"，
+    // 而不是"名字叫空"—— 清空输入框就是恢复自动命名的意思。
+    this.custom = spec.custom || '';
     this.root = spec.root || null;
     this.activePaneId = spec.activePaneId || null;
     this.panes = {};
     this.view = null;
     this.el = null;
   }
+
+  // autoLabel 是"不干预时标签会显示什么"：跟着活动窗格的终端标题走
+  // （shell、vim、claude 都会设 OSC 标题）。
+  Tab.prototype.autoLabel = function () {
+    var p = this.activePane();
+    return p ? shortTitle(p.title) : '终端';
+  };
+
+  // label 是标签上真正显示的名字：改过就是那个名字，否则跟着程序走。
+  Tab.prototype.label = function () {
+    return this.custom || this.autoLabel();
+  };
+
+  // paintLabel 把名字刷进 DOM。
+  //
+  // 顺带同步 t.title：布局落盘存的是它，刷新之后至少先显示上次的名字，
+  // 而不是一排"终端"等会话连上来再改。
+  Tab.prototype.paintLabel = function () {
+    var s = this.label();
+    this.title = s;
+    if (this.el) {
+      var span = this.el.querySelector('.title');
+      if (span) {
+        span.textContent = s;
+        // 名字被省略号截断时，鼠标停上去能看到全的。
+        span.title = s;
+      }
+    }
+    if (this.ws.activeTabId === this.id) document.title = s + ' — TerminalS';
+  };
+
+  // beginRename 把标签上的名字换成一个输入框（双击标签进入）。
+  //
+  // 初值给的是"现在显示的名字"并全选，而不是空的：改名十有八九是在原名
+  // 基础上微调，从空白开始等于让人重新打一遍。
+  Tab.prototype.beginRename = function () {
+    if (!this.el || this.el.querySelector('.tab-input')) return false;
+
+    var self = this;
+    var span = this.el.querySelector('.title');
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tab-input';
+    input.maxLength = maxTabName;
+    input.spellcheck = false;
+    input.value = this.label();
+    input.setAttribute('aria-label', '工作区名称');
+
+    span.style.display = 'none';
+    this.el.classList.add('renaming');
+    this.el.insertBefore(input, span);
+
+    var done = false;
+    var finish = function (commit) {
+      if (done) return;
+      done = true;
+      input.remove();
+      span.style.display = '';
+      self.el.classList.remove('renaming');
+      if (!commit) return;
+
+      // 折成一行、去掉首尾空白，再按长度截断 —— 换行会把标签撑成两行。
+      var v = input.value.replace(/\s+/g, ' ').trim().slice(0, maxTabName);
+      // 内容如果正好还是自动名，就当没改过。双击看一眼、顺手回车一下
+      // 不该把名字钉死 —— 那样 claude、vim 之后改标题，标签就不跟着动了。
+      self.custom = v && v !== self.autoLabel() ? v : '';
+      self.paintLabel();
+      self.ws.save();
+    };
+
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      }
+    });
+    // 点到别处、Tab 走开都算保存 —— 和文件重命名、地址栏改网址一个约定。
+    input.addEventListener('blur', function () { finish(true); });
+    input.addEventListener('click', function (e) { e.stopPropagation(); });
+    input.addEventListener('dblclick', function (e) { e.stopPropagation(); });
+
+    // 焦点要等到这一帧的 activateTab 把终端接过去之后再抢回来：双击的两下
+    // click 都会走 activateTab，它里面的 rAF 会 pane.focus()，先 focus 会被顶掉。
+    requestAnimationFrame(function () {
+      if (done) return;
+      input.focus();
+      input.select();
+    });
+    return true;
+  };
 
   Tab.prototype.pane = function (id) {
     return this.panes[id] || null;
@@ -2374,6 +2478,9 @@
         return {
           id: t.id,
           title: t.title,
+          // 用户双击标签改的名字要单独存：title 是"眼下显示的那句话"，
+          // 会随程序改标题而变，光存它等于每次刷新都丢掉用户起的名字。
+          custom: t.custom,
           activePaneId: t.activePaneId,
           root: t.root,
           leaves: leaves
@@ -2427,6 +2534,7 @@
       var t = new Tab(this, {
         id: td.id,
         title: td.title,
+        custom: td.custom,
         root: td.root,
         activePaneId: td.activePaneId
       });
@@ -2462,14 +2570,7 @@
 
     this.tabs.push(t);
     t.view = el('div', 'tabview');
-    t.el = el('div', 'tab');
-    t.el.innerHTML = '<span class="title">终端</span><button class="close" title="关闭标签">×</button>';
-    if (spec && spec.title) t.el.querySelector('.title').textContent = spec.title;
-    t.el.querySelector('.close').addEventListener('click', function (e) {
-      e.stopPropagation();
-      this.closeTab(t);
-    }.bind(this));
-    t.el.addEventListener('click', function () { this.activateTab(t.id); }.bind(this));
+    this.buildTabEl(t);
 
     $('panes').appendChild(t.view);
     $('tabstrip').appendChild(t.el);
@@ -2482,6 +2583,39 @@
     if (focus) pane.focus();
     this.save();
     return t;
+  };
+
+  // buildTabEl 建标签的 DOM 并接上事件。
+  //
+  // 新建标签和"从布局恢复"两条路径都走它：以前这两处各写了一遍，加一个
+  // 交互（比如双击改名）就得记得改两遍，漏一处就是"刷新之后不好使"。
+  Workspace.prototype.buildTabEl = function (t) {
+    var self = this;
+    t.el = el('div', 'tab');
+    t.el.innerHTML = '<span class="title"></span><button class="close" title="关闭标签">×</button>';
+
+    t.el.querySelector('.close').addEventListener('click', function (e) {
+      e.stopPropagation();
+      self.closeTab(t);
+    });
+    t.el.addEventListener('click', function () { self.activateTab(t.id); });
+    t.el.addEventListener('dblclick', function (e) {
+      // 双击关闭按钮不该进入改名 —— 那是想连点两下关掉它。
+      if (e.target.closest && e.target.closest('.close')) return;
+      e.preventDefault();
+      self.renameTab(t);
+    });
+
+    t.paintLabel();
+    return t.el;
+  };
+
+  // renameTab 双击标签时进入改名。标签不是当前标签的话先切过去，
+  // 否则改完名字看不见效果（改的是背后那个标签）。
+  Workspace.prototype.renameTab = function (t) {
+    if (!t) return;
+    if (this.activeTabId !== t.id) this.activateTab(t.id);
+    t.beginRename();
   };
 
   Workspace.prototype.activateTab = function (id, doSave) {
@@ -2497,7 +2631,8 @@
 
     var pane = t.activePane();
     if (pane) this.focusPane(pane, true);
-    document.title = (pane ? pane.title : t.title) + ' — TerminalS';
+    // 后台标签期间会话可能换过标题（onPaneTitle 只看当前标签），切回来时补刷一次。
+    t.paintLabel();
     store(ACTIVE_KEY, id + ':' + (pane ? pane.id : ''));
 
     // 切回来时窗格尺寸可能变了（隐藏期间 display:none，clientWidth 为 0），必须重排。
@@ -2611,9 +2746,9 @@
       // 标签栏给的是"人看的一句话"，不是程序的完整路径。PowerShell
       // 会把标题设成 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe，
       // 原样贴上去会把整个标签撑爆。
-      var shown = shortTitle(pane.title);
-      t.el.querySelector('.title').textContent = shown;
-      document.title = shown + ' — TerminalS';
+      //
+      // 用户自己改过名字的标签不会被这里覆盖：paintLabel 里 custom 优先。
+      t.paintLabel();
     }
     this.save();
   };
@@ -2644,6 +2779,9 @@
       if (p === pane) p.focus(); else p.blur();
     });
     t.activePaneId = pane.id;
+    // 标签名跟着"当前这一格"走：分屏之后每格跑的东西不一样，焦点在哪一格，
+    // 标签就该显示哪一格的名字（改过名的标签不受影响，paintLabel 里 custom 优先）。
+    t.paintLabel();
     if (!silent) this.save();
   };
 
@@ -3878,6 +4016,10 @@
     // 确认框开着的时候，快捷键一律不响应：底下的窗格马上要没了，
     // 这时候还允许新建标签/分屏只会让人更懵。Esc 由确认框自己的监听处理。
     if (this.isAsking()) return;
+    // 正在给标签改名：按键归输入框。这里的监听挂在捕获阶段，不挡的话
+    // Ctrl+Alt+T 之类会在打到一半时凭空多出一个标签。
+    if (document.activeElement && document.activeElement.classList
+      && document.activeElement.classList.contains('tab-input')) return;
     if (!e.ctrlKey || !e.altKey || e.metaKey) return;
     var handled = true;
 
@@ -3986,14 +4128,7 @@
         var t = app.tabs[i];
         t.view = el('div', 'tabview');
         t.view.classList.add('hidden');
-        t.el = el('div', 'tab');
-        t.el.innerHTML = '<span class="title"></span><button class="close" title="关闭标签">×</button>';
-        t.el.querySelector('.title').textContent = t.title;
-        t.el.querySelector('.close').addEventListener('click', function (e) {
-          e.stopPropagation();
-          app.closeTab(this);
-        }.bind(t));
-        t.el.addEventListener('click', function () { app.activateTab(this.id); }.bind(t));
+        app.buildTabEl(t);
         $('panes').appendChild(t.view);
         $('tabstrip').appendChild(t.el);
 

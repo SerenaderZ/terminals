@@ -11,6 +11,7 @@ One Go binary plus an xterm.js frontend, with every frontend asset embedded in t
 **Workspace**
 
 - Multiple tabs, each with its own layout tree; hidden tabs simply stop rendering — their processes and sockets keep running
+- A tab is named after the focused pane's terminal title; **double-click a tab** to name it yourself (Enter confirms, Esc cancels, clearing it hands the name back to the program). Names are stored server-side with the layout
 - Nested splits in any direction, drag the divider to resize, empty nodes collapse automatically
 - Layout lives on the server: reload, close the window, or open from another device and you get **the same processes** back
 - A vertical rail on each pane: the `×` at the top closes the pane, the track below is a hand-drawn scrollbar — drag it, click it, or just scroll
