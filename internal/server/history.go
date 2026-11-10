@@ -132,8 +132,29 @@ func (s *Server) serveHistoryLog(w http.ResponseWriter, r *http.Request, h *hist
 		}
 	}
 
-	start := int64(0)
+	// to=N 表示"只给前面这 N 个字节"。
+	//
+	// 继续一条老记录时，新 shell 的启动输出已经追加进同一个文件了，里面带
+	// 清屏序列；整段灌回浏览器会把刚铺好的历史擦掉。所以前端按 READY 给的
+	// histStart 把终点卡在这条会话开始之前。
 	size := st.Size()
+	if v := r.URL.Query().Get("to"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			if n < size {
+				size = n
+			}
+		}
+	}
+	if size == 0 {
+		// 这条记录在接手续用之前没有内容：什么都不用铺。
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-History-Offset", "0")
+		w.Header().Set("X-History-Total", "0")
+		return
+	}
+
+	start := int64(0)
 	if tail > 0 && size > tail {
 		start = size - tail
 		// 从整行开始，别把半截转义序列灌给终端 —— 半截 CSI 会把后面
@@ -145,7 +166,7 @@ func (s *Server) serveHistoryLog(w http.ResponseWriter, r *http.Request, h *hist
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-History-Offset", strconv.FormatInt(start, 10))
-	w.Header().Set("X-History-Total", strconv.FormatInt(st.Size(), 10))
+	w.Header().Set("X-History-Total", strconv.FormatInt(size, 10))
 	http.ServeContent(w, r, "", st.ModTime(), io.NewSectionReader(f, start, size))
 }
 

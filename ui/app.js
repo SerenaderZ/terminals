@@ -224,21 +224,35 @@
 
   // ---- 历史记录列表用到的几个小工具 ----
 
-  // histTitle 优先用终端标题（OSC 0/2 设的，claude、vim 都会设）。
+  // histTitle 就是"那次会话的第一条命令"，后端在用户敲下回车时记下来的。
   //
-  // 但 PowerShell / cmd 会把窗口标题设成自己的可执行文件全路径
-  // （C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe），
-  // 整条塞进列表里既长又没信息量 —— 取文件名、去掉扩展名。
+  // 以前这里取的是终端标题（OSC 0/2），但那个名字是程序随手设的：npm 跑起来
+  // 会短暂把标题改成 npm，PowerShell 更是直接设成 exe 的全路径。用户要的是
+  // "按我输入的第一条指令命名"，所以现在标题只有一个来源 —— 第一条命令。
+  //
+  // 两个例外仍然要兜：0.3.1 之前留下的记录没有命令标题；崩溃后从日志恢复
+  // 出来的记录也可能没有。那就退回目录名，总比一片空白强。
   function histTitle(it) {
     var t = it && it.title ? String(it.title).trim() : '';
     if (t) {
-      if (/[\\/]/.test(t)) t = baseName(t).replace(/\.(exe|com|bat|cmd)$/i, '');
+      // 老记录里可能存着整条 exe 路径，取文件名。
+      if (/[\\/]/.test(t) && !/\s/.test(t)) t = baseName(t).replace(/\.(exe|com|bat|cmd)$/i, '');
       if (t) return t;
     }
     var b = baseName(it && it.cwd);
     if (b) return b;
     var s = it && it.shell ? baseName(it.shell) : '';
     return (s || '终端').replace(/\.(exe|com|bat|cmd)$/i, '');
+  }
+
+  // histWhen 是列表显示、排序、分组统一用的时间：关闭过就是关闭时间，
+  // 还在跑就是最后一次活动时间。和后端 Entry.When() 是同一套规则 ——
+  // 用户要的"以我最后关闭那个窗口的时间为准"。
+  function histWhen(it) {
+    if (!it) return 0;
+    if (it.ended) return it.ended;
+    if (it.touched) return it.touched;
+    return it.created || 0;
   }
 
   function baseName(p) {
@@ -1283,6 +1297,10 @@
 
     var params = new URLSearchParams();
     if (this.sid) params.set('sid', this.sid);
+    // 服务端据此知道"这个窗格是接着哪条历史记录开的"：新建会话时把日志追加
+    // 到那条记录里，列表上不会多出一行。sid 命中存活会话时它会被忽略 ——
+    // 刷新页面不会因此多开一个会话。
+    if (this.opts.historyId) params.set('hist', this.opts.historyId);
     if (this.term) {
       params.set('cols', String(this.term.cols));
       params.set('rows', String(this.term.rows));
@@ -1426,8 +1444,15 @@
         // 那段写入之前 READY 分支会 reset 一次屏幕 —— 铺早了会被清掉。
         // 250ms 是给回放落地留的余量，之后再 reset + 写历史 + 补一个回车
         // 让 shell 重新打出提示符。
+        //
+        // histResumed / histStart 是"接着老记录写"的会话才有的：日志里前
+        // histStart 个字节才是上一次的内容。新 shell 的启动输出已经接在后面，
+        // 里面带清屏序列 —— 整段铺回来会把历史擦掉，所以只取到那个位置。
         if (self.opts.historyId && !self.historyLoaded) {
           self.historyLoaded = true;
+          if (info.histResumed) {
+            self.historyTo = info.histStart || 0;
+          }
           clearTimeout(self.historyTimer);
           self.historyTimer = setTimeout(function () { self.loadHistory(); }, 250);
         }
@@ -1578,7 +1603,11 @@
     var id = this.opts.historyId;
     if (!id || this.disposed || !this.term) return;
 
-    fetch(API + 'history/' + encodeURIComponent(id) + '/log')
+    // 只取到这次接手之前的位置：再往后是新 shell 的启动输出（含清屏），
+    // 铺回去会把历史擦掉。
+    var q = '';
+    if (typeof this.historyTo === 'number') q = '?to=' + this.historyTo;
+    fetch(API + 'history/' + encodeURIComponent(id) + '/log' + q)
       .then(function (r) {
         if (!r.ok) return null;
         // 服务端默认只给最后 2MB。被省略时它把总大小和起点放在这两个头里，
@@ -1589,6 +1618,9 @@
       })
       .then(function (res) {
         if (self.disposed || !res) return;
+        // 这条老记录在接手续用之前是空的（比如打开过又立刻关掉）。此时
+        // 什么都别铺：reset + 一条分界线只会把新 shell 的画面擦掉。
+        if (!res.text) return;
         var foot = '';
         if (res.off > 0) {
           foot = '\x1b[2m—— 更早的内容已省略（共 ' + fmtBytes(res.total) +
@@ -3011,6 +3043,14 @@
       return (histTitle(it) + ' ' + (it.cwd || '') + ' ' + (it.shell || '')).toLowerCase().indexOf(q) >= 0;
     });
 
+    // 后端已经排好了，这里再排一次是因为列表会在本地被改动（删一条、
+    // 打开一条之后它的时间会变），不能让顺序停在拉取数据的那一刻。
+    items = items.slice().sort(function (a, b) {
+      var d = histWhen(b) - histWhen(a);
+      if (d) return d;
+      return (b.created || 0) - (a.created || 0);
+    });
+
     $('hist-count').textContent = all.length
       ? (q ? items.length + ' / ' + all.length + ' 条' : all.length + ' 条')
       : '';
@@ -3023,7 +3063,7 @@
     // 按天分组，和浏览器历史页一样。分组的先后就是列表顺序（最新在前）。
     var group = '';
     items.forEach(function (it) {
-      var g = histDayGroup(it.created);
+      var g = histDayGroup(histWhen(it));
       if (g !== group) {
         group = g;
         var h = el('div', 'hist-group');
@@ -3055,7 +3095,7 @@
       row.appendChild(main);
 
       var time = el('span', 'hist-time');
-      time.textContent = histClock(it.created);
+      time.textContent = histClock(histWhen(it));
       row.appendChild(time);
 
       var del = el('button', 'hist-del');

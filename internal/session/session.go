@@ -51,6 +51,12 @@ type Ready struct {
 	// 序列上。前端收到 true 时必须整屏重建，不能试图接着旧内容往下写。
 	ReplayTruncated bool `json:"replayTruncated"`
 
+	// HistStart 只在"接着一条老记录"时出现：日志里前这么多字节是上一次
+	// 留下的完整内容，前端只回放这一段。再往后是新 shell 的启动输出，
+	// 其中带清屏序列，整段灌回去会把刚铺好的历史擦掉。
+	HistStart   *int64 `json:"histStart,omitempty"`
+	HistResumed bool   `json:"histResumed,omitempty"`
+
 	// ReplaySkipped 表示这次挂载**故意没给回放**：缓冲里的历史是在另一个
 	// 列数下写的，按现在的宽度灌回去只会得到一屏叠字。前端清屏后等程序
 	// 自己重画（Resize 会补一个 SIGWINCH）。
@@ -164,8 +170,24 @@ type Session struct {
 	altMu sync.Mutex
 	alt   altScanner
 
-	// titleScan 从输出里捡终端标题，跨读块保留状态。只有 readLoop 用。
-	titleScan titleScanner
+	// 历史记录：写哪个文件、有没有定名、定名前攒着的输出。
+	//
+	// histID 和 ID 不一定相同。从历史列表点进来的会话是新会话，但日志要接
+	// 着那条老记录往下写 —— 这就是"我打开了老的记录，后续输入的指令还保存
+	// 在这一条里"。
+	//
+	// 命名要等用户敲下第一条命令：只是打开一个窗口、什么都没干，不该留下
+	// 记录。在那之前输出先攒在 histBuf 里（shell 的欢迎语、第一条提示符），
+	// 定名时一次性补进日志，回看时开头不会是空白。
+	histID    string
+	histMu    sync.Mutex
+	histNamed bool
+	histBuf   []byte
+	histCmd   cmdScanner
+	// histStart 是接手一条老记录时，日志里已经有多少字节属于"上一次"。
+	// 前端只回放这一段；再往后是新 shell 的启动输出。
+	histStart   int64
+	histResumed bool
 
 	writeMu sync.Mutex
 
@@ -196,7 +218,10 @@ func newID() string {
 //
 // id 非空表示"认领一个已存在的会话"（core 重启后接管 tmux 会话），
 // 此时 sid 沿用旧值，前端 localStorage 里存着它，重连就自动接上了。
-func newSession(cfg Config, id string, cols, rows int) (*Session, error) {
+//
+// histID 非空表示"接着一条历史记录往下写"。它和 id 是两回事：沿用老记录的
+// 会话会有一个全新的 id，日志却写在老记录的文件里。
+func newSession(cfg Config, id, histID string, cols, rows int) (*Session, error) {
 	if cols < 2 {
 		cols = 2
 	}
@@ -270,15 +295,23 @@ func newSession(cfg Config, id string, cols, rows int) (*Session, error) {
 	s.proc = proc
 	s.PID = proc.Pid()
 
-	// 历史记录从第一帧输出之前就要就位：迟一步，shell 的欢迎语和
-	// 第一条提示符就丢了，回看时开头是空白。
+	// 历史记录从这里开始记账，但**不一定**马上开一条：默认要等用户敲下
+	// 第一条命令（见 histName），什么都没干的窗口不该出现在历史里。
+	//
+	// 从历史列表点进来的（histID 非空）沿用老记录：直接接上去，后面所有
+	// 输出都追加进同一个文件，列表里始终只有那一行。
 	if h := cfg.History; h != nil {
-		h.Begin(history.Entry{
-			ID:      id,
-			Cwd:     cfg.Cwd,
-			Shell:   cfg.Shell,
-			Created: s.Created.Unix(),
-		})
+		s.histID = id
+		resume := id
+		if histID != "" {
+			resume = histID
+		}
+		if start, ok := h.Resume(resume); ok {
+			s.histID = resume
+			s.histNamed = true
+			s.histStart = start
+			s.histResumed = true
+		}
 	}
 
 	go s.readLoop()
@@ -307,12 +340,7 @@ func (s *Session) readLoop() {
 
 			// 历史把原始字节照抄一份。注意顺序：先写日志再广播 ——
 			// 广播可能因为队列满把连接踢掉，但历史不该受这个影响。
-			if h := s.cfg.History; h != nil {
-				h.Append(s.ID, chunk)
-				if title, ok := s.titleScan.Scan(chunk); ok {
-					h.SetTitle(s.ID, title)
-				}
-			}
+			s.histRecord(chunk)
 
 			s.broadcast(chunk)
 		}
@@ -380,10 +408,10 @@ func (s *Session) finish(code int) {
 		}(c)
 	}
 
-	// 收尾历史：关文件、记退出码。放在 close(done) 之前 —— Wait 那边
+	// 收尾历史：关文件、记结束码。放在 close(done) 之前 —— Wait 那边
 	// 只会等 done，之后 Manager 可能立刻把会话删掉，别让记录卡在"还在跑"。
-	if h := s.cfg.History; h != nil {
-		h.End(s.ID, code)
+	if h := s.cfg.History; h != nil && s.histID != "" {
+		h.End(s.histID, code)
 	}
 
 	close(s.done)
@@ -467,10 +495,75 @@ func (s *Session) Write(p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
+	s.histNameFromInput(p)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.proc.Write(p)
 	return err
+}
+
+// 定名前最多攒这么多输出。正常 shell 在第一条命令之前只吐几百字节，
+// 512KB 足够兜住一屏登录脚本；再多就只保留前半段，绝不无限吃内存。
+const histBufCap = 512 << 10
+
+// histRecord 把一块输出记进历史。
+//
+// 还没定名的时候只往内存里攒：这个窗口最后可能什么都不算（用户就是扫了
+// 一眼提示符），那就一个字节都不该落盘。
+func (s *Session) histRecord(chunk []byte) {
+	if s.cfg.History == nil {
+		return
+	}
+	s.histMu.Lock()
+	if !s.histNamed {
+		if len(s.histBuf) < histBufCap {
+			s.histBuf = append(s.histBuf, chunk...)
+		}
+		s.histMu.Unlock()
+		return
+	}
+	id := s.histID
+	s.histMu.Unlock()
+	s.cfg.History.Append(id, chunk)
+}
+
+// histNameFromInput 盯着用户敲的第一条命令，用它给这次会话命名。
+//
+// 一旦定名就开一条记录，并把定名前攒下的输出补在最前面 —— 这样日志的开头
+// 仍然是 shell 的欢迎语和第一条提示符，而不是半截命令。
+func (s *Session) histNameFromInput(p []byte) {
+	if s.cfg.History == nil {
+		return
+	}
+	s.histMu.Lock()
+	named := s.histNamed
+	s.histMu.Unlock()
+	if named {
+		return
+	}
+	cmd, ok := s.histCmd.Scan(p)
+	if !ok {
+		return
+	}
+
+	h := s.cfg.History
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	if s.histNamed { // 并发下只认第一条
+		return
+	}
+	s.histNamed = true
+	h.Begin(history.Entry{
+		ID:      s.histID,
+		Title:   cmd,
+		Cwd:     s.Cwd,
+		Shell:   s.Shell,
+		Created: s.Created.Unix(),
+	})
+	if len(s.histBuf) > 0 {
+		h.Append(s.histID, s.histBuf)
+	}
+	s.histBuf = nil
 }
 
 // Resize 调整 PTY 行列数。
@@ -574,7 +667,18 @@ func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated, skip
 		ReplayLen:       replayLen,
 		ReplayTruncated: truncated,
 		ReplaySkipped:   skipped,
+		HistStart:       s.histStartPtr(),
+		HistResumed:     s.histResumed,
 	}
+}
+
+// histStartPtr 只在接手老记录时给出起点，普通会话给 nil（JSON 里不出现）。
+func (s *Session) histStartPtr() *int64 {
+	if !s.histResumed {
+		return nil
+	}
+	v := s.histStart
+	return &v
 }
 
 // Info 返回会话摘要。

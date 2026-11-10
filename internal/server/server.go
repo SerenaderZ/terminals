@@ -304,7 +304,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		if body.Rows <= 0 {
 			body.Rows = 32
 		}
-		sess, err := s.mgr.Create(body.Cols, body.Rows)
+		sess, err := s.mgr.Create("", body.Cols, body.Rows)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 			return

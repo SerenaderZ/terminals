@@ -151,6 +151,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	cols := atoiDefault(q.Get("cols"), 120)
 	rows := atoiDefault(q.Get("rows"), 32)
 	sid := q.Get("sid")
+	// hist 表示"这个窗格是为了继续某一条历史记录而开的"。
+	//
+	// 只在真正新建会话时生效：浏览器刷新时 URL 上还带着它，但 sid 命中的
+	// 会话还活着，直接复用 —— 否则每刷新一次就给同一条记录添一个新会话。
+	hist := q.Get("hist")
 
 	up := upgrader
 	if s.opt.Dev {
@@ -163,7 +168,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	sess, err := s.mgr.GetOrCreate(sid, cols, rows)
+	sess, err := s.mgr.GetOrCreate(sid, hist, cols, rows)
 	if err != nil {
 		_ = conn.WriteMessage(websocket.BinaryMessage,
 			proto.Frame(proto.KindError, []byte(err.Error())))

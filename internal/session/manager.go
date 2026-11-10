@@ -43,7 +43,9 @@ func NewManager(cfg Config) *Manager {
 func (m *Manager) Config() Config { return m.cfg }
 
 // Create 新建一个会话。
-func (m *Manager) Create(cols, rows int) (*Session, error) {
+//
+// histID 非空表示"接着这条历史记录往下写"（用户点开了历史列表里的某一条）。
+func (m *Manager) Create(histID string, cols, rows int) (*Session, error) {
 	m.mu.Lock()
 	if len(m.m) >= m.cfg.MaxSessions {
 		n := m.cfg.MaxSessions
@@ -52,7 +54,7 @@ func (m *Manager) Create(cols, rows int) (*Session, error) {
 	}
 	m.mu.Unlock()
 
-	s, err := newSession(m.cfg, "", cols, rows)
+	s, err := newSession(m.cfg, "", histID, cols, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +86,8 @@ func (m *Manager) Restore() int {
 		if len(m.m) >= m.cfg.MaxSessions {
 			break
 		}
-		s, err := newSession(m.cfg, p.SID, 120, 32)
+		// 认领回来的 tmux 会话：日志接着上次那条写，时间也跟着刷新。
+		s, err := newSession(m.cfg, p.SID, p.SID, 120, 32)
 		if err != nil {
 			continue
 		}
@@ -125,13 +128,13 @@ func (m *Manager) Get(id string) (*Session, bool) {
 }
 
 // GetOrCreate 有 sid 且存活就复用，否则新建。刷新页面能续上就靠它。
-func (m *Manager) GetOrCreate(id string, cols, rows int) (*Session, error) {
+func (m *Manager) GetOrCreate(id, histID string, cols, rows int) (*Session, error) {
 	if id != "" {
 		if s, ok := m.Get(id); ok && s.Alive() {
 			return s, nil
 		}
 	}
-	return m.Create(cols, rows)
+	return m.Create(histID, cols, rows)
 }
 
 // Kill 结束并移除一个会话。
