@@ -1064,6 +1064,15 @@
     // Ctrl+Insert / Shift+Insert 是 Windows 传统终端的复制粘贴键，
     // 浏览器不占用，比 Ctrl+Shift+C 可靠 —— 后者在 Chrome 里会先被
     // 开发者工具吃掉，网页的 preventDefault 拦不住。
+    //
+    // Ctrl+Shift+Insert 是"原样复制"：行尾空白、末尾空行都留着。默认那条
+    // 会把每行尾部由界面补出来的不可见空白裁掉（全屏 TUI 会拿它们把整行
+    // 填满，留着就会在折行处多出空行），但偶尔要的就是原封不动。
+    if (e.key === 'Insert' && mod && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      this.copy(true);
+      return;
+    }
     if (e.key === 'Insert' && mod && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       this.copy();
@@ -1917,7 +1926,15 @@
   //
   // 不经过 xterm 的选区服务：那玩意儿会被全屏程序的重绘清掉，而且清掉的
   // 时机完全不可预测。缓冲区里的文字才是唯一可靠的来源。
-  Session.prototype.rangeText = function () {
+  //
+  // **换行是保留的**：这是"一个屏幕行 = 一行文本"，行与行之间拼 '\n'，选中
+  // 的中间空行也会原样留下（空行取出来是空串，join 之后就是连续两个 '\n'）。
+  // 裁掉的只有每行末尾那截**终端填充**，不是换行，也不会把两行粘成一行。
+  //
+  // raw=true 走"原样"通道（Ctrl+Shift+Insert），除了 xterm 自己对 ASCII
+  // 空格的裁剪之外不做任何加工：连行尾的 NBSP、末尾的空行都留着。给那些
+  // 真的要精确空白的地方用（对齐的表格、填好的定宽文本）。
+  Session.prototype.rangeText = function (raw) {
     var t = this.term, r = this.selRange;
     if (!t || !r) return '';
     var buf = t.buffer && t.buffer.active;
@@ -1925,7 +1942,7 @@
     var out = [];
     for (var y = r.sy; y <= r.ey; y++) {
       var line = buf.getLine(y);
-      if (!line) continue;
+      if (!line) { out.push(''); continue; }
       var a = (y === r.sy) ? r.sx : 0;
       var b = (y === r.ey) ? r.ex : t.cols;
       // 行尾空白是终端补的，复制出来只会碍事 —— 而且必须是**每一行**都裁。
@@ -1935,9 +1952,12 @@
       // 它们把每行补满整宽：复制出来每行后面拖着上百个不可见字符，粘到
       // 会折行的地方（Claude Code 的输入框）就每行折出一个"空行" ——
       // 三行文本粘出来变五行。宽文本框里看不出来，所以只在某一处复发。
-      out.push(line.translateToString(true, a, b).replace(/[\s\u200b\ufeff]+$/, ''));
+      var s = line.translateToString(true, a, b);
+      out.push(raw ? s : s.replace(/[\s\u200b\ufeff]+$/, ''));
     }
-    return out.join('\n').replace(/\s+$/, '');
+    var text = out.join('\n');
+    // 末尾的换行去掉：粘贴时它只会多顶出一个空白行。raw 通道保留原样。
+    return raw ? text : text.replace(/\s+$/, '');
   };
 
   Session.prototype.paintSelection = function () {
@@ -1990,9 +2010,9 @@
   //   - 我们自己复制完主动收掉
   // 之所以不设有效期：框和文字都在我们手里，程序重绘动不了它们。
   // 以前按 15 秒过期，用户慢慢读一会儿再右键就变成粘贴。
-  Session.prototype.selectionText = function () {
+  Session.prototype.selectionText = function (raw) {
     if (this.selRange) {
-      var live = this.rangeText();
+      var live = this.rangeText(raw);
       if (live) return live;
     }
     return this.selSnap ? this.selSnap.text : '';
@@ -2013,8 +2033,8 @@
   // copy 复制当前选区（快捷键走这里），返回是否真的复制到了东西。
   // 与右键共用 selectionText，所以高亮已被冲掉时快照内容也能复制；
   // 区别是这里不清选区 —— Ctrl+Insert 之后多半还要继续用鼠标。
-  Session.prototype.copy = function () {
-    var text = this.selectionText();
+  Session.prototype.copy = function (raw) {
+    var text = this.selectionText(raw);
     if (!text) return false;
     this.copyText(text);
     return true;
