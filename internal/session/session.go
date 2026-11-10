@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -195,6 +196,14 @@ type Session struct {
 	// 点开历史再关掉，日志里就多一行 eason@host:~$ —— 点几次长几行。
 	// 等用户真的敲下一条命令，它才转成 false，从那一刻起照常记账。
 	histQuiet bool
+	// histTail 是静默期最近的输出，只留最后 histTailCap 个字节。
+	//
+	// 它唯一的用途是解除静默时把"用户敲的那行命令的回显"补回来。回显是
+	// shell 打出来的输出，比回车早到 —— 用户敲的每个字都在静默期被丢掉，
+	// 只剩回车之后 shell 的回报，回看时就是一行空白后面直接跟着
+	// "bash: 114514: command not found"。上限很小：静默期本来就只覆盖
+	// 开机那几屏，留尾巴是为了定位，不是为了回放。
+	histTail []byte
 
 	writeMu sync.Mutex
 
@@ -517,6 +526,22 @@ func (s *Session) Write(p []byte) error {
 // 512KB 足够兜住一屏登录脚本；再多就只保留前半段，绝不无限吃内存。
 const histBufCap = 512 << 10
 
+// histTailCap 是静默期尾巴的大小。开机那几屏加上一行提示符远到不了 8KB，
+// 而如果用户接手后一直不敲命令、让程序在自己刷屏，尾巴也只是固定开销。
+const histTailCap = 8 << 10
+
+// tailAppend 把 chunk 接到 buf 末尾，只保留最后 max 个字节。
+func tailAppend(buf, chunk []byte, max int) []byte {
+	if len(chunk) >= max {
+		return append(buf[:0], chunk[len(chunk)-max:]...)
+	}
+	buf = append(buf, chunk...)
+	if n := len(buf) - max; n > 0 {
+		buf = append(buf[:0], buf[n:]...)
+	}
+	return buf
+}
+
 // histRecord 把一块输出记进历史。
 //
 // 还没定名的时候只往内存里攒：这个窗口最后可能什么都不算（用户就是扫了
@@ -527,8 +552,9 @@ func (s *Session) histRecord(chunk []byte) {
 	}
 	s.histMu.Lock()
 	if s.histQuiet {
-		// 接手老记录、用户还没敲过东西：这段输出直接丢掉。不缓存 ——
-		// 它包含清屏序列，下次回放时会把铺好的历史擦掉。
+		// 接手老记录、用户还没敲过东西：这段输出不落盘。只留最后一个尾巴，
+		// 解除静默时用它把命令回显补回来（见 histNameFromInput）。
+		s.histTail = tailAppend(s.histTail, chunk, histTailCap)
 		s.histMu.Unlock()
 		return
 	}
@@ -571,9 +597,22 @@ func (s *Session) histNameFromInput(p []byte) {
 	s.histMu.Lock()
 	defer s.histMu.Unlock()
 	if quiet {
-		// 从这一步开始，回显的命令和它的输出才进日志。之前那一行提示符
-		// 不再补写：老记录的末尾本来就是上一次留下的提示符，接得上。
+		// 从这一步开始，回显的命令和它的输出才进日志。
+		//
+		// 但命令本身（用户敲的那几个字）是 shell 回显出来的，它比这一下
+		// 回车早到，刚才被静默期丢掉了 —— 不补回去，回看时就是一行空白
+		// 后面直接跟着 "bash: 114514: command not found"。补法是在静默期
+		// 留下的尾巴里找这行命令最后一次出现的位置，从那里原样接上：
+		// 只搬用真的回显过的字节，不会凭空造出用户没打过的字（密码提示
+		// 那种不回显的输入自然找不到，也就什么都不补）。
+		//
+		// 那行提示符仍然不补：老记录的末尾本来就是上一次留下的提示符，
+		// 接上命令正好是 "eason@host:~$ ls"。
 		s.histQuiet = false
+		if i := bytes.LastIndex(s.histTail, []byte(cmd)); i >= 0 {
+			h.Append(s.histID, s.histTail[i:])
+		}
+		s.histTail = nil
 		return
 	}
 	if s.histNamed { // 并发下只认第一条

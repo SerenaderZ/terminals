@@ -103,6 +103,15 @@ process.on('exit', cleanup);
     window.__ts.app.activePane().session.send(1, new TextEncoder().encode(c));
   }, cmd);
 
+  // 逐字发送：真实键盘每个字是一次 onData，PTY 的回显也就一个个回来，回车
+  // 是最后一击。整串一次发出去的话，回显全都排在回车之后，测不出"静默期
+  // 把回显吃掉"这件事。
+  const typeCharByChar = async (cmd) => {
+    for (const ch of cmd) { await type(ch); await sleep(40); }
+    await sleep(300);
+    await type('\r');
+  };
+
   const newTab = () => page.evaluate(() => {
     const app = window.__ts.app;
     app.newTab(true);
@@ -145,6 +154,13 @@ process.on('exit', cleanup);
     const t = await r.text();
     return t.indexOf(a.needle) >= 0;
   }, { id, needle });
+
+  // 日志结尾若干字节，断言失败时用来旁观到底写进去了什么。
+  const logTail = (id, n) => page.evaluate(async (a) => {
+    const r = await fetch('api/history/' + encodeURIComponent(a.id) + '/log');
+    const t = await r.text();
+    return t.slice(-a.n);
+  }, { id, n });
 
   check('日志里有第一条命令的输出', await logHas(rec.id, MARK));
 
@@ -252,6 +268,18 @@ process.on('exit', cleanup);
     JSON.stringify(restored.slice(0, 120)));
 
   // ---------- 6. 继续敲：还是同一条记录 ----------
+  // 接手之后敲的第一条命令，回显必须落进日志。
+  //
+  // 用户报过：点开历史再敲一条无效命令（114514），回看时那行是空白，只剩
+  // "bash: 114514: command not found"。命令本身是 shell 回显出来的输出，
+  // 比回车早到，静默期把它丢了。用注释当命令：有回显、没有任何输出，所以
+  // 日志里出现这个串就只可能是回显。
+  const CMD_ECHO = '# ECHO_' + MARK;
+  await typeCharByChar(CMD_ECHO);
+  await sleep(1200);
+  check('接手后第一条命令的回显写进了日志', await logHas(rec.id, 'ECHO_' + MARK),
+    JSON.stringify((await logTail(rec.id, 200)).slice(-120)));
+
   await type(CMD2 + '\r');
   await sleep(1400);
   const after = await termText(afterTabs - 1);
