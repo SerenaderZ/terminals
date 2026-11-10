@@ -200,6 +200,92 @@
     return Math.floor(d / 86400) + ' 天前';
   }
 
+  function fmtBytes(n) {
+    if (!n || n < 0) return '0 B';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  // shortTitle 把"程序给自己设的窗口标题"收拾成能放进标签栏的样子。
+  //
+  // 只处理一种情况：整个标题就是一个路径（盘符或 / 开头、没有空格）。
+  // PowerShell 的 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+  // 属于这一类。像 "vim - /etc/nginx/nginx.conf" 这种带说明的标题不动。
+  function shortTitle(t) {
+    var s = String(t == null ? '' : t).trim();
+    if (!s) return s;
+    if (/^(?:[A-Za-z]:[\\/]|\/)/.test(s) && !/\s/.test(s)) {
+      var b = baseName(s).replace(/\.(exe|com|bat|cmd)$/i, '');
+      if (b) return b;
+    }
+    return s;
+  }
+
+  // ---- 历史记录列表用到的几个小工具 ----
+
+  // histTitle 优先用终端标题（OSC 0/2 设的，claude、vim 都会设）。
+  //
+  // 但 PowerShell / cmd 会把窗口标题设成自己的可执行文件全路径
+  // （C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe），
+  // 整条塞进列表里既长又没信息量 —— 取文件名、去掉扩展名。
+  function histTitle(it) {
+    var t = it && it.title ? String(it.title).trim() : '';
+    if (t) {
+      if (/[\\/]/.test(t)) t = baseName(t).replace(/\.(exe|com|bat|cmd)$/i, '');
+      if (t) return t;
+    }
+    var b = baseName(it && it.cwd);
+    if (b) return b;
+    var s = it && it.shell ? baseName(it.shell) : '';
+    return (s || '终端').replace(/\.(exe|com|bat|cmd)$/i, '');
+  }
+
+  function baseName(p) {
+    if (!p) return '';
+    var s = String(p).replace(/[\\/]+$/, '');
+    var i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  function histSub(it) {
+    var parts = [];
+    if (it.cwd) parts.push(it.cwd);
+    if (typeof it.bytes === 'number' && it.bytes > 0) parts.push(fmtBytes(it.bytes));
+    return parts.join(' · ');
+  }
+
+  function histClock(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000);
+    var hh = ('0' + d.getHours()).slice(-2);
+    var mm = ('0' + d.getMinutes()).slice(-2);
+    var g = histDayGroup(ts);
+    if (g === '今天') return hh + ':' + mm;
+    if (g === '昨天') return '昨天 ' + hh + ':' + mm;
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + hh + ':' + mm;
+  }
+
+  // histDayGroup 按"自然日"分组，不按 24 小时 —— 凌晨 0:30 和前一天
+  // 23:30 差不到一小时，但用户心里那是两天。
+  function histDayGroup(ts) {
+    var d = new Date(ts * 1000);
+    var now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    var that = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    var diff = Math.round((today - that) / 86400000);
+    if (diff <= 0) return '今天';
+    if (diff === 1) return '昨天';
+    if (diff < 7) return '最近 7 天';
+    return '更早';
+  }
+
+  function histEmpty(text) {
+    var d = el('div', 'hist-empty');
+    d.textContent = text;
+    return d;
+  }
+
   // ------------------------------------------------------------- 单个 pane
 
   function Pane(ws, spec) {
@@ -207,6 +293,9 @@
     this.id = spec.id || uid('p');
     this.sid = spec.sid || null;
     this.title = spec.title || '终端';
+    // 从历史记录打开时，连上之后再把这那一次的输出铺上去（见
+    // Session.loadHistory）。historyId 传给 Session，由它在 READY 之后处理。
+    this.historyId = spec.historyId || null;
     this.exited = false;
     this.focused = false;
     this.el = null;
@@ -237,6 +326,7 @@
       scrollback: this.ws.settings.scrollback,
       sid: this.sid,
       webgl: useWebgl && this.ws.settings.webgl,
+      historyId: this.historyId,
       onScroll: function () { self.scheduleScrollSync(); },
       onState: function (state) {
         self.el.dataset.state = state;
@@ -433,6 +523,9 @@
     this.scheduleScrollSync();
   };
 
+  // connect 一律直接连。历史记录由 Session 在收到 READY 之后再铺 ——
+  // 先连后铺是因为新会话的回放（shell 的欢迎语）会在 READY 之后立刻到达，
+  // 而 READY 分支会 reset 一次屏幕；先铺的历史会被这一次 reset 清掉。
   Pane.prototype.connect = function () {
     this.session.connect();
   };
@@ -536,6 +629,11 @@
     this.paintTimer = 0;
     this.widthTimer = 0;
     this.replayPainted = false;
+    // 从历史记录打开时用：historyId 是那条记录的 id，historyLoaded 保证
+    // 只铺一次（同一窗格重连后不再重铺，否则内容会叠）。
+    this.historyText = null;
+    this.historyLoaded = false;
+    this.historyTimer = 0;
     // 回放期间不要把终端的"自动应答"发回 PTY。
     //
     // 回放是把历史输出重演一遍，而历史里可能有程序当初发出的查询序列
@@ -1321,6 +1419,18 @@
         // 是不是按"宽度对不上"跳过了回放。
         self.lastReady = info;
         self.opts.onReady && self.opts.onReady(info);
+
+        // 从历史面板打开的那个窗格：等这一屏回放画完，再把历史铺上去。
+        //
+        // 为什么不早一点：READY 之后紧跟着就是新会话的回放（shell 的欢迎语），
+        // 那段写入之前 READY 分支会 reset 一次屏幕 —— 铺早了会被清掉。
+        // 250ms 是给回放落地留的余量，之后再 reset + 写历史 + 补一个回车
+        // 让 shell 重新打出提示符。
+        if (self.opts.historyId && !self.historyLoaded) {
+          self.historyLoaded = true;
+          clearTimeout(self.historyTimer);
+          self.historyTimer = setTimeout(function () { self.loadHistory(); }, 250);
+        }
         return;
       }
 
@@ -1458,6 +1568,89 @@
   Session.prototype.grab = function () {
     if (this.opts.onGrab) this.opts.onGrab();
     else this.focus();
+  };
+
+  // loadHistory 拉一条历史记录，铺进终端，再补一个回车让 shell 重画提示符。
+  //
+  // 只在这个窗格"生来就是为了展示历史"时调用一次（opts.historyId）。
+  Session.prototype.loadHistory = function () {
+    var self = this;
+    var id = this.opts.historyId;
+    if (!id || this.disposed || !this.term) return;
+
+    fetch(API + 'history/' + encodeURIComponent(id) + '/log')
+      .then(function (r) {
+        if (!r.ok) return null;
+        // 服务端默认只给最后 2MB。被省略时它把总大小和起点放在这两个头里，
+        // 拼一句说明，省得用户以为记录短了。
+        var total = parseInt(r.headers.get('X-History-Total') || '0', 10);
+        var off = parseInt(r.headers.get('X-History-Offset') || '0', 10);
+        return r.text().then(function (t) { return { text: t, total: total, off: off }; });
+      })
+      .then(function (res) {
+        if (self.disposed || !res) return;
+        var foot = '';
+        if (res.off > 0) {
+          foot = '\x1b[2m—— 更早的内容已省略（共 ' + fmtBytes(res.total) +
+            '，这里显示最后 ' + fmtBytes(res.total - res.off) + '）——\x1b[0m\r\n';
+        }
+        // 末尾不补换行：历史最后一行通常就是一个提示符，补换行会多出一个
+        // 空行；后面那个回车会让 shell 自己把提示符打到下一行。
+        // 末尾补一条分界线：历史里可能有大段输出，滚到中间时没人分得清
+        // "哪一行开始是新的"。这条线就是那条边。
+        var tail = '\r\n\x1b[2m── 以上是历史记录 ──\x1b[0m\r\n';
+        self.writeHistory(res.text + (foot ? '\r\n' + foot : '') + tail, function () {
+          if (self.disposed) return;
+          // 历史铺完了，可 shell 的提示符在上一步的 reset 里被清掉了。
+          // 敲一个空行让它自己重画 —— 不要用 term.write 伪造一个提示符：
+          // 真实提示符带 git 分支、虚拟环境、conda 那些，伪造的迟早对不上。
+          self.send(C.INPUT, new Uint8Array([13]));
+        });
+      })
+      .catch(function () { /* 拿不到历史就当作一个普通的新标签 */ });
+  };
+
+  // writeHistory 把一条历史记录铺进终端。写完调用 done。
+  //
+  // 三件事必须做对：
+  //   1) 先 reset —— 新窗格已经画好了光标和提示符，历史要占满整屏；
+  //   2) 分块写 —— 几 MB 一次性交给 xterm 会把主线程卡住好几秒，界面
+  //      像死了一样。每块 64KB，写完让出一帧，加载过程是能看见的；
+  //   3) 上 replaying 锁 —— 历史里同样有终端查询（DA / DSR），xterm 会
+  //      照规矩应答，应答走 onData 就进了后面那个 shell。这正是 0.2.21
+  //      修的"重连冒出 1;2c: command not found"，换了个入口而已。
+  Session.prototype.writeHistory = function (text, done) {
+    var self = this;
+    var fin = function () {
+      self.replaying = false;
+      clearTimeout(self.historyTimer);
+      self.paintAll();
+      if (done) done();
+    };
+    if (!this.term || !text) { fin(); return; }
+
+    this.term.reset();
+    this.replaying = true;
+    clearTimeout(this.historyTimer);
+    // 兜底：万一某个 write 回调没回来，别把键盘永久锁死。
+    this.historyTimer = setTimeout(function () { self.replaying = false; }, 30000);
+
+    var CHUNK = 64 * 1024;
+    var pos = 0;
+    var step = function () {
+      if (self.disposed || !self.term) { fin(); return; }
+      if (pos >= text.length) { fin(); return; }
+      var end = pos + CHUNK;
+      // 别把代理对劈成两半（emoji、部分扩展汉字）。
+      if (end < text.length) {
+        var c = text.charCodeAt(end - 1);
+        if (c >= 0xd800 && c <= 0xdbff) end--;
+      }
+      var part = text.slice(pos, end);
+      pos = end;
+      self.term.write(part, function () { setTimeout(step, 0); });
+    };
+    step();
   };
 
   // installProtocolGuard 堵住 xterm 的一个小疏漏：重复设置同一个鼠标协议
@@ -2368,8 +2561,12 @@
     var t = this.activeTab();
     if (!t) return;
     if (t.activePane() === pane) {
-      t.el.querySelector('.title').textContent = pane.title;
-      document.title = pane.title + ' — TerminalS';
+      // 标签栏给的是"人看的一句话"，不是程序的完整路径。PowerShell
+      // 会把标题设成 C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe，
+      // 原样贴上去会把整个标签撑爆。
+      var shown = shortTitle(pane.title);
+      t.el.querySelector('.title').textContent = shown;
+      document.title = shown + ' — TerminalS';
     }
     this.save();
   };
@@ -2743,6 +2940,169 @@
   };
 
   Workspace.prototype.isBackgroundOpen = function () { return !$('bg-panel').hidden; };
+
+  // ------------------------------------------------------------ 历史记录
+  //
+  // 一块浮层，照着浏览器历史页做：上面搜索框，下面按时间分组的列表，
+  // 每条右边是时间，鼠标移上去才露出删除。
+  //
+  // 点一条不是"只读回看"，而是新开一个标签：先把那一次会话的输出铺满，
+  // 下面接一个能用的 shell（见 Pane.openHistory）。所以用户看到的既是
+  // 历史，也是一个可以接着敲的终端。
+
+  Workspace.prototype.isHistoryOpen = function () { return !$('hist-panel').hidden; };
+
+  Workspace.prototype.toggleHistoryPanel = function () {
+    if (this.isHistoryOpen()) this.closeHistoryPanel();
+    else this.openHistoryPanel();
+  };
+
+  Workspace.prototype.openHistoryPanel = function () {
+    $('hist-panel').hidden = false;
+    $('hist-search').value = '';
+    this.historyItems = null;
+    this.historyErr = '';
+    this.renderHistoryPanel();
+    $('hist-search').focus();
+    this.loadHistory();
+  };
+
+  Workspace.prototype.loadHistory = function () {
+    var self = this;
+    fetch(API + 'history').then(function (r) {
+      return r.ok ? r.json() : null;
+    }).then(function (j) {
+      if (!self.isHistoryOpen()) return;
+      self.historyItems = (j && j.ok && j.data && j.data.items) || [];
+      self.historyErr = '';
+      self.renderHistoryPanel();
+    }).catch(function () {
+      if (!self.isHistoryOpen()) return;
+      self.historyItems = [];
+      self.historyErr = '历史记录读取失败，检查一下服务是否还在';
+      self.renderHistoryPanel();
+    });
+  };
+
+  Workspace.prototype.closeHistoryPanel = function () {
+    if (this.isHistoryOpen()) $('hist-panel').hidden = true;
+  };
+
+  Workspace.prototype.renderHistoryPanel = function () {
+    var self = this;
+    var list = $('hist-list');
+    list.replaceChildren();
+
+    if (this.historyItems === null) {
+      list.appendChild(histEmpty('正在读取…'));
+      $('hist-count').textContent = '';
+      return;
+    }
+    if (this.historyErr) {
+      list.appendChild(histEmpty(this.historyErr));
+      $('hist-count').textContent = '';
+      return;
+    }
+
+    var all = this.historyItems;
+    var q = ($('hist-search').value || '').trim().toLowerCase();
+    var items = all.filter(function (it) {
+      if (!q) return true;
+      return (histTitle(it) + ' ' + (it.cwd || '') + ' ' + (it.shell || '')).toLowerCase().indexOf(q) >= 0;
+    });
+
+    $('hist-count').textContent = all.length
+      ? (q ? items.length + ' / ' + all.length + ' 条' : all.length + ' 条')
+      : '';
+
+    if (!items.length) {
+      list.appendChild(histEmpty(q ? '没有匹配的记录' : '还没有历史记录'));
+      return;
+    }
+
+    // 按天分组，和浏览器历史页一样。分组的先后就是列表顺序（最新在前）。
+    var group = '';
+    items.forEach(function (it) {
+      var g = histDayGroup(it.created);
+      if (g !== group) {
+        group = g;
+        var h = el('div', 'hist-group');
+        h.textContent = g;
+        list.appendChild(h);
+      }
+
+      var row = el('div', 'hist-item');
+      row.dataset.id = it.id;
+      if (it.live) row.classList.add('live');
+
+      var icon = el('span', 'hist-icon');
+      icon.textContent = '›_';
+      row.appendChild(icon);
+
+      var main = el('div', 'hist-main');
+      var title = el('div', 'hist-title');
+      title.textContent = histTitle(it);
+      title.title = title.textContent;
+      main.appendChild(title);
+
+      var sub = histSub(it);
+      if (sub) {
+        var meta = el('div', 'hist-meta');
+        meta.textContent = sub;
+        meta.title = sub;
+        main.appendChild(meta);
+      }
+      row.appendChild(main);
+
+      var time = el('span', 'hist-time');
+      time.textContent = histClock(it.created);
+      row.appendChild(time);
+
+      var del = el('button', 'hist-del');
+      del.type = 'button';
+      del.title = '删除这条记录';
+      del.textContent = '✕';
+      del.addEventListener('click', function (e) {
+        e.stopPropagation();
+        self.deleteHistory(it);
+      });
+      row.appendChild(del);
+
+      row.addEventListener('click', function () { self.openHistoryEntry(it); });
+      list.appendChild(row);
+    });
+  };
+
+  Workspace.prototype.openHistoryEntry = function (it) {
+    this.closeHistoryPanel();
+    this.newTab(true, { historyId: it.id, title: histTitle(it) });
+    banner('已载入这次会话的历史，下面可以直接继续操作', 'ok');
+  };
+
+  Workspace.prototype.deleteHistory = function (it) {
+    var self = this;
+    fetch(API + 'history/' + encodeURIComponent(it.id), { method: 'DELETE' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('delete failed');
+        self.historyItems = (self.historyItems || []).filter(function (x) { return x.id !== it.id; });
+        self.renderHistoryPanel();
+      })
+      .catch(function () { banner('删除失败，记录还在', 'warn'); });
+  };
+
+  Workspace.prototype.askClearHistory = function () {
+    var self = this;
+    this.ask('清空全部历史记录？', '所有会话的输出都会被删掉，不能恢复。', '清空', function () {
+      fetch(API + 'history', { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('clear failed');
+          self.historyItems = [];
+          self.renderHistoryPanel();
+          banner('历史记录已清空', 'ok');
+        })
+        .catch(function () { banner('清空失败', 'warn'); });
+    });
+  };
 
   // 方向键移动焦点：按几何位置找最近的邻居，比按树序更符合直觉。
   Workspace.prototype.moveFocus = function (dir) {
@@ -3274,11 +3634,44 @@
 
   $('btn-bg').addEventListener('click', function (e) {
     e.stopPropagation();
-    if (app.isBackgroundOpen()) app.closeBackgroundPanel();
-    else app.openBackgroundPanel();
+    if (app.isBackgroundOpen()) { app.closeBackgroundPanel(); return; }
+    // 两块浮层都在右上角，同时开着会重叠。
+    app.closeHistoryPanel();
+    app.openBackgroundPanel();
   });
 
   $('bg-close').addEventListener('click', function () { app.closeBackgroundPanel(); });
+
+  // --------------------------------------------------------- 历史记录面板
+  //
+  // 和后台会话面板同一套开关逻辑，只是挂在另一个按钮上。两套浮层
+  // 互斥：打开一个就收起另一个，免得两块叠在右上角。
+
+  $('btn-history').addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (!app.isHistoryOpen()) app.closeBackgroundPanel();
+    app.toggleHistoryPanel();
+  });
+
+  $('hist-close').addEventListener('click', function () { app.closeHistoryPanel(); });
+  $('hist-clear').addEventListener('click', function () { app.askClearHistory(); });
+  $('hist-search').addEventListener('input', function () { app.renderHistoryPanel(); });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (!app.isHistoryOpen()) return;
+    if (app.isAsking()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    app.closeHistoryPanel();
+  }, true);
+
+  document.addEventListener('mousedown', function (e) {
+    if (!app.isHistoryOpen()) return;
+    if (app.isAsking()) return;
+    if ($('hist-panel').contains(e.target) || $('btn-history').contains(e.target)) return;
+    app.closeHistoryPanel();
+  }, true);
 
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
@@ -3438,6 +3831,10 @@
       case 'ArrowUp': this.moveFocus('up'); break;
       case 'ArrowDown': this.moveFocus('down'); break;
       case 'k': case 'K': this.clearActivePane(); break;
+      case 'h': case 'H':
+        if (!this.isHistoryOpen()) this.closeBackgroundPanel();
+        this.toggleHistoryPanel();
+        break;
       case 'q': case 'Q': this.askCloseAll(); break;
       case ',': case '<': this.toggleSettings(); break;
       case '[': this.cycleTab(-1); break;

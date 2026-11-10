@@ -21,6 +21,7 @@ import (
 
 	"terminals/internal/config"
 	"terminals/internal/diag"
+	"terminals/internal/history"
 	"terminals/internal/server"
 	"terminals/internal/session"
 )
@@ -168,6 +169,14 @@ func main() {
 		}))
 	}
 
+	// 历史记录放在数据目录下的 history/ 里：删应用目录 = 删历史，
+	// 不需要额外的清理逻辑。
+	hist := history.New(filepath.Join(dir, "history"))
+	if hist != nil {
+		log.Printf("历史目录：%s", hist.Dir())
+	}
+	cfg.History = hist
+
 	mgr := session.NewManager(cfg)
 
 	// tmux 后端下先把上次留下的会话认领回来，这样前端存着的 sid 一连接就续上。
@@ -196,6 +205,7 @@ func main() {
 		Version:      session.Version,
 		Layout:       layoutStore,
 		Settings:     settingsStore,
+		History:      hist,
 	})
 
 	httpSrv := &http.Server{
@@ -239,6 +249,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
+
+	// 关掉历史日志句柄。数据早就写进去了，这一步是让"正在写的文件"
+	// 变成一个干净的闭合文件 —— 下次启动扫描时字节数才是准的。
+	if hist != nil {
+		hist.Close()
+	}
 
 	if *socketPath != "" {
 		_ = os.Remove(*socketPath)

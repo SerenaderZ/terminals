@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"terminals/internal/history"
 	"terminals/internal/proto"
 )
 
@@ -163,6 +164,9 @@ type Session struct {
 	altMu sync.Mutex
 	alt   altScanner
 
+	// titleScan 从输出里捡终端标题，跨读块保留状态。只有 readLoop 用。
+	titleScan titleScanner
+
 	writeMu sync.Mutex
 
 	// resizeMu 把"改尺寸"串行化。
@@ -266,6 +270,17 @@ func newSession(cfg Config, id string, cols, rows int) (*Session, error) {
 	s.proc = proc
 	s.PID = proc.Pid()
 
+	// 历史记录从第一帧输出之前就要就位：迟一步，shell 的欢迎语和
+	// 第一条提示符就丢了，回看时开头是空白。
+	if h := cfg.History; h != nil {
+		h.Begin(history.Entry{
+			ID:      id,
+			Cwd:     cfg.Cwd,
+			Shell:   cfg.Shell,
+			Created: s.Created.Unix(),
+		})
+	}
+
 	go s.readLoop()
 	go s.waitLoop()
 
@@ -289,6 +304,15 @@ func (s *Session) readLoop() {
 			s.altMu.Lock()
 			s.alt.scan(chunk)
 			s.altMu.Unlock()
+
+			// 历史把原始字节照抄一份。注意顺序：先写日志再广播 ——
+			// 广播可能因为队列满把连接踢掉，但历史不该受这个影响。
+			if h := s.cfg.History; h != nil {
+				h.Append(s.ID, chunk)
+				if title, ok := s.titleScan.Scan(chunk); ok {
+					h.SetTitle(s.ID, title)
+				}
+			}
 
 			s.broadcast(chunk)
 		}
@@ -354,6 +378,12 @@ func (s *Session) finish(code int) {
 			time.Sleep(200 * time.Millisecond)
 			c.Close()
 		}(c)
+	}
+
+	// 收尾历史：关文件、记退出码。放在 close(done) 之前 —— Wait 那边
+	// 只会等 done，之后 Manager 可能立刻把会话删掉，别让记录卡在"还在跑"。
+	if h := s.cfg.History; h != nil {
+		h.End(s.ID, code)
 	}
 
 	close(s.done)

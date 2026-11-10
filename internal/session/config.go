@@ -1,9 +1,13 @@
 package session
 
-import "runtime"
+import (
+	"runtime"
+
+	"terminals/internal/history"
+)
 
 // Version 是协议与实现版本，会随 READY 帧发给前端。
-const Version = "0.2.21"
+const Version = "0.3.0"
 
 // Config 是会话管理器的配置。
 type Config struct {
@@ -36,6 +40,10 @@ type Config struct {
 
 	// StatePath 是会话清单落盘位置，core 重启后靠它认领 tmux 会话。
 	StatePath string
+
+	// History 是历史记录仓库。nil 表示不记录 —— 开发时不想留痕迹、
+	// 或者磁盘只读，都会走这条分支。
+	History *history.Store
 }
 
 // 后端取值。

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"terminals/internal/config"
+	"terminals/internal/history"
 	"terminals/internal/session"
 	"terminals/ui"
 )
@@ -31,6 +32,8 @@ type Options struct {
 	// Settings 是用户设置的存储。nil 时退回一份内存默认值，
 	// 这样开发模式下不配 --data-dir 也能打开设置页。
 	Settings *config.Store
+	// History 是会话历史仓库。nil 表示不记录 / 不提供历史面板。
+	History *history.Store
 }
 
 // Server 组装路由与中间件。
@@ -67,6 +70,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/wscheck", s.handleWSCheck)
 	s.mux.HandleFunc("/api/layout", s.handleLayout)
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
+	s.mux.HandleFunc("/api/history", s.handleHistory)
+	s.mux.HandleFunc("/api/history/", s.handleHistoryByID)
 
 	// 静态资源：http.FileServerFS 自带路径穿越防护（会拒绝 ..），
 	// 不需要自己拼路径。
