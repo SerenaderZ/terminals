@@ -5,9 +5,8 @@
  *   1) 鼠标停在右侧轨道上滚轮，也要能翻这一格的历史（以前只有文字区能滚，
  *      用户一直在轨道上滚，感觉就是"只能拖滑块"）；
  *   2) 滚哪个窗格，焦点就跟到哪个窗格；
- *   3) 拖选（这里是 selectAll 触发同一条 selectionChange 路径）默认自动复制；
- *   4) 关掉"选中即复制"后不再自动写剪贴板；
- *   5) 右键：有选区是复制，没选区是粘贴；Ctrl+Insert / Shift+Insert；
+ *   3) 拖选只选不复制 —— 拖错了左键点一下取消，剪贴板不该被动过；
+ *   4) 右键：有选区是复制，没选区是粘贴；Ctrl+Insert / Shift+Insert；
  *   6) 全屏程序（备用屏幕）里滚轮不空转、也不偷偷发方向键。
  */
 import puppeteer from 'puppeteer-core';
@@ -105,57 +104,60 @@ try {
   check('反向滚轮能回到底部', backBottom.viewportY === backBottom.baseY,
     `viewportY=${backBottom.viewportY} baseY=${backBottom.baseY}`);
 
-  // ---- 2. 选中即复制 ----
-  await page.evaluate(() => { window.__copied.length = 0; });
-  await page.evaluate(() => {
-    const st = window.__ts.app.activePane().session;
-    st.term.clearSelection();
-    st.term.selectAll();
-  });
-  await sleep(400);
-  const copied = await page.evaluate(() => window.__copied.slice());
-  check('选中文字后自动写剪贴板', copied.length > 0, `calls=${copied.length}`);
-  check('复制的内容确实是屏幕上的文字',
-    copied.length > 0 && /ROW-0\d{3} copy-target/.test(copied[0]),
-    (copied[0] || '').slice(0, 40).replace(/\s+/g, ' '));
-
-  // ---- 3. 关掉开关后不再自动复制 ----
-  await page.evaluate(() => {
-    window.__ts.app.saveSettings({ copyOnSelect: false });
-    const st = window.__ts.app.activePane().session;
-    st.term.clearSelection();
-    window.__copied.length = 0;
-  });
-  await sleep(200);
-  await page.evaluate(() => window.__ts.app.activePane().session.term.selectAll());
-  await sleep(400);
-  const copied2 = await page.evaluate(() => window.__copied.length);
-  check('关掉"选中即复制"后不再自动写', copied2 === 0, `calls=${copied2}`);
-
-  // ---- 4. 右键：有选区是复制 ----
+  // ---- 2. 拖选只选不复制 ----
   const paneBox = await page.evaluate(() => {
     const b = document.querySelector('.tabview:not(.hidden) .pane').getBoundingClientRect();
-    return { x: b.left + b.width * 0.4, y: b.top + b.height * 0.5 };
+    return { x: b.left, y: b.top, w: b.width, h: b.height };
   });
+  const dragSelect = async () => {
+    await page.mouse.move(paneBox.x + 24, paneBox.y + 24);
+    await page.mouse.down();
+    await page.mouse.move(paneBox.x + 360, paneBox.y + 120, { steps: 12 });
+    await page.mouse.up();
+    await sleep(350);
+  };
+
   await page.evaluate(() => { window.__copied.length = 0; });
-  // 选区还留着（上一步 selectAll 选的）
-  await page.mouse.click(paneBox.x, paneBox.y, { button: 'right' });
+  await dragSelect();
+  const dragState = await page.evaluate(() => ({
+    copied: window.__copied.length,
+    text: window.__ts.app.activePane().session.selectionText(),
+  }));
+  check('拖选后剪贴板没被动过', dragState.copied === 0, `calls=${dragState.copied}`);
+  check('拖选确实选中了文字', /ROW-0\d{3}/.test(dragState.text),
+    JSON.stringify(dragState.text.slice(0, 40)));
+
+  // 左键点一下取消：同样的结论，而且框和文字都收掉了
+  await page.mouse.click(paneBox.x + paneBox.w * 0.5, paneBox.y + paneBox.h * 0.6);
+  await sleep(350);
+  const afterCancel = await page.evaluate(() => ({
+    copied: window.__copied.length,
+    text: window.__ts.app.activePane().session.selectionText(),
+  }));
+  check('取消选区不会复制', afterCancel.copied === 0, `calls=${afterCancel.copied}`);
+  check('取消之后选区文字也空了', afterCancel.text === '', JSON.stringify(afterCancel.text));
+
+  // ---- 3. 右键：有选区是复制（复制只发生在这一刻） ----
+  await dragSelect();
+  await page.evaluate(() => { window.__copied.length = 0; });
+  await page.mouse.click(paneBox.x + 24, paneBox.y + 24, { button: 'right' });
   await sleep(400);
   const ctxCopy = await page.evaluate(() => ({
     copied: window.__copied.length,
     banner: (document.getElementById('banner').hidden ? '' : document.getElementById('banner').textContent),
-    hasSel: window.__ts.app.activePane().session.term.hasSelection()
+    text: window.__ts.app.activePane().session.selectionText(),
   }));
   check('有选区时右键 = 复制', ctxCopy.copied === 1, `calls=${ctxCopy.copied}`);
   check('复制后给出一次轻提示', /已复制/.test(ctxCopy.banner), ctxCopy.banner);
+  check('复制之后选区收掉了（下一次右键是粘贴）', ctxCopy.text === '', JSON.stringify(ctxCopy.text));
 
-  // ---- 5. 右键：没选区是粘贴 ----
+  // ---- 4. 右键：没选区是粘贴 ----
   const pasted = await page.evaluate(() => {
     const st = window.__ts.app.activePane().session;
-    st.term.clearSelection();
+    st.clearSelection();
     window.__pasted = 0;
-    const orig = st.paste;
     st.paste = function () { window.__pasted++; };
+    st.pasteInner = function () { window.__pasted++; return true; };
     return new Promise((res) => setTimeout(() => res(window.__pasted), 0));
   });
   await page.mouse.click(paneBox.x, paneBox.y, { button: 'right' });
@@ -166,13 +168,12 @@ try {
   });
   check('没选区时右键 = 粘贴（保持原行为）', afterCtx.pasted === 1, `paste=${afterCtx.pasted}`);
 
-  // ---- 6. Ctrl+Insert 复制 / Shift+Insert 粘贴 ----
+  // ---- 5. Ctrl+Insert 复制 / Shift+Insert 粘贴 ----
   // 先点一下把焦点放回终端：点击会清掉选区，所以顺序是"点 → 选 → 按键"。
-  await page.mouse.click(paneBox.x, paneBox.y);
+  await page.mouse.click(paneBox.x + paneBox.w * 0.5, paneBox.y + paneBox.h * 0.6);
   await sleep(150);
+  await dragSelect();
   await page.evaluate(() => {
-    const st = window.__ts.app.activePane().session;
-    st.term.selectAll();
     window.__copied.length = 0;
     window.__pasted = 0;
   });
@@ -213,8 +214,6 @@ try {
 
   check('没有 JS 报错', errors.length === 0, errors.slice(0, 3).join(' | '));
 
-  // 恢复设置，别把测试状态留给下一次
-  await page.evaluate(() => { window.__ts.app.saveSettings({ copyOnSelect: true }); });
 } finally {
   await browser.close();
 }

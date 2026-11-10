@@ -32,8 +32,7 @@
     fontSize: 14,
     webgl: true,
     cursorBlink: true,
-    scrollback: 10000,
-    copyOnSelect: true
+    scrollback: 10000
   };
 
   function cachedSettings() {
@@ -907,14 +906,15 @@
       self.focus();
     });
 
-    // 选中即复制（默认开，设置页里可以关）。挪到拖选结束时做 ——
-    // 现在选区由我们自己维护，不再有"选区每变一次就触发一次"的事件，
-    // 拖动过程中也不需要每帧写剪贴板。
-    this.copyOnSelect = function () {
-      if (!self.owner || !self.owner.settings.copyOnSelect) return;
-      var text = self.selectionText();
-      if (text) self.copyText(text);
-    };
+    // 拖选就只是拖选：不写剪贴板，也不动应用内那份记录。
+    //
+    // 以前这里是"选中即复制"（默认开），副作用是用户拖选一段、发现拖错了、
+    // 左键点一下想取消 —— 那段文字其实已经在剪贴板里了，紧接着右键"粘贴"
+    // 又把刚取消的东西吐了出来，看起来像是取消没生效。
+    //
+    // 现在只有一个时刻会把文字放进剪贴板：右键（有选区）或者 Ctrl+Insert /
+    // Ctrl+Shift+C。拖选、取消都不产生任何复制，右键粘到的永远是"上一次
+    // 真正复制的那段"。
 
     // 全屏 TUI（vim/htop/claude）进出备用屏幕时，xterm 会整块换缓冲区。
     // 这一下 WebGL 渲染器偶尔会留下上一次画面的"幽灵字符"（字形图集没刷），
@@ -936,7 +936,7 @@
     requestAnimationFrame(function () { self.fit(); self.attachWebgl(); });
   };
 
-  // afterBufferSwap 在缓冲区切换后整屏重画，顺带刷掉 WebGL 的字形图集。
+  // afterBufferSwap 在缓冲区切换后整屏重画。
   //
   // 为什么必须重画：TUI 退出时是一串"恢复主屏 + 恢复光标"的转义序列，
   // 渲染器如果只按脏区增量更新，就会把 TUI 的残留格子留在屏幕上 ——
@@ -946,19 +946,18 @@
   // （claude 退出时的 "Resume this session with…" 就是），这些字节是在
   // 第一次 refresh 之后才落屏的。只刷一次，它们依旧按增量绘制，上一屏
   // 留下的脏格子就跟着一起留在画面上。第二次补刷把它们一并盖掉。
+  //
+  // 重画就是 refresh，**不要**顺手 clearTextureAtlas()。xterm 的字形图集
+  // 是按"配置（字体/字号/配色/DPR）"缓存、多个渲染器共用的：清掉它等于
+  // 把别的窗格模型里记的字形坐标变成野指针，那些窗格下一次重绘就会画成
+  // 一堆错位的方块。见 paintAll 里的同一段说明。
   Session.prototype.afterBufferSwap = function () {
     var self = this;
     var paint = function () {
       if (!self.term) return;
       try { self.term.refresh(0, self.term.rows - 1); } catch (e) { }
     };
-    requestAnimationFrame(function () {
-      if (!self.term) return;
-      if (self.webgl && typeof self.webgl.clearTextureAtlas === 'function') {
-        try { self.webgl.clearTextureAtlas(); } catch (e) { }
-      }
-      paint();
-    });
+    requestAnimationFrame(paint);
     clearTimeout(this.swapTimer);
     this.swapTimer = setTimeout(paint, 80);
   };
@@ -1243,19 +1242,29 @@
     }, 250);
   };
 
-  // paintAll 整屏重画，顺带刷掉 WebGL 的字形图集。
+  // paintAll 整屏重画。
   //
   // 灌完回放之后必须来一发：回放是一大段字节，xterm 按脏区增量绘制，
   // 没被新内容覆盖到的行会留着上一次连接的字形像素 —— 用户看到的就是
   // "顶部几行是上一次的残影"。
+  //
+  // 这里只 refresh，**绝不能**再调 clearTextureAtlas()。
+  //
+  // 以前每次重画都清一遍字形图集，单窗格时没问题；多标签以后就成了
+  // "打开历史的那个标签把别的标签画花"：xterm 的字形图集不是每个渲染器
+  // 一份，而是按配置（字体、字号、配色、DPR）缓存的 —— 两个窗格长得一样
+  // 就共用同一个图集对象。clearTextureAtlas() 会把图集内容清空，同时只把
+  // **自己**那个渲染器的模型清掉；别的窗格模型里记的字形坐标还指着旧位置，
+  // 而图集已经重新分配过了，于是它们下一次重绘就去错误的地方取字形 ——
+  // 屏幕上是一堆错位的方块和乱码。刷新一次能救回来，正是因为重画会按新
+  // 坐标重新登记字形。
+  //
+  // 残影是"没重画"，不是"图集脏"，refresh 就够了。
   Session.prototype.paintAll = function () {
     var self = this;
     if (!this.term) return;
     var paint = function () {
       if (self.disposed || !self.term) return;
-      if (self.webgl && typeof self.webgl.clearTextureAtlas === 'function') {
-        try { self.webgl.clearTextureAtlas(); } catch (e) { }
-      }
       try { self.term.refresh(0, self.term.rows - 1); } catch (e) { }
       self.paintSelection();
     };
@@ -1847,7 +1856,6 @@
     if (!sel) { this.clearSelection(); return; }
     this.selSnap = { text: sel };
     this.paintSelection();
-    this.copyOnSelect();
   };
 
   Session.prototype.beginSelection = function (cell, e, block) {
@@ -1903,7 +1911,6 @@
     if (!text) { this.clearSelection(); return; }
     this.selSnap = { text: text };
     this.paintSelection();
-    this.copyOnSelect();
   };
 
   // rangeText 直接按范围从缓冲区里取字。
@@ -2494,11 +2501,19 @@
     store(ACTIVE_KEY, id + ':' + (pane ? pane.id : ''));
 
     // 切回来时窗格尺寸可能变了（隐藏期间 display:none，clientWidth 为 0），必须重排。
+    //
+    // 顺便整屏重画一次：隐藏期间这个画布的 WebGL 上下文还在，但浏览器把它
+    // 合成上去的内容可能已经作废（画布被从图层里摘下再挂回，绘制缓冲不保证
+    // 还在）。不重画的话，切回来看到的可能是上一次合成留下的旧画面或者一片
+    // 错位 —— 用户那边的说法就是"切到别的标签就乱码"。refresh 一遍最省事，
+    // 内容没变时肉眼也看不出来。
     var self = this;
     requestAnimationFrame(function () {
       eachLeaf(t.root, function (leaf) {
         var p = t.panes[leaf.id];
-        if (p) p.fit();
+        if (!p) return;
+        p.fit();
+        if (p.session) p.session.paintAll();
       });
       if (pane) pane.focus();
     });
@@ -3073,7 +3088,14 @@
 
       var row = el('div', 'hist-item');
       row.dataset.id = it.id;
-      if (it.live) row.classList.add('live');
+      if (it.live) {
+        // 还在跑的那条不能重新打开：两条会话往同一个日志文件里写，回看时
+        // 两段输出会交错在一起，谁也分不清哪一行属于哪一次。所以整行点不动，
+        // 只留右侧的删除。
+        row.classList.add('live', 'busy');
+        row.setAttribute('aria-disabled', 'true');
+        row.title = '这条会话还在运行，不能重新打开';
+      }
 
       var icon = el('span', 'hist-icon');
       icon.textContent = '›_';
@@ -3114,6 +3136,13 @@
   };
 
   Workspace.prototype.openHistoryEntry = function (it) {
+    if (!it) return;
+    // 运行中的记录不能重开（见上面 renderHistoryPanel 里的说明）。这里再挡
+    // 一道：行上的点击可以被别的地方触发，规则只该有一处判断。
+    if (it.live) {
+      banner('这条会话还在运行，先把它结束掉才能重新打开', 'warn');
+      return;
+    }
     this.closeHistoryPanel();
     this.newTab(true, { historyId: it.id, title: histTitle(it) });
     banner('已载入这次会话的历史，下面可以直接继续操作', 'ok');
@@ -3571,7 +3600,6 @@
     $('set-fontsize').value = s.fontSize;
     $('set-blink').checked = !!s.cursorBlink;
     $('set-webgl').checked = !!s.webgl;
-    $('set-copyselect').checked = !!s.copyOnSelect;
     var sb = $('set-scrollback');
     sb.value = String(s.scrollback);
     // 服务端存的值可能不在下拉的几档里（比如手改过文件），
@@ -3631,14 +3659,6 @@
 
   $('set-scrollback').addEventListener('change', function () {
     app.saveSettings({ scrollback: parseInt(this.value, 10) || 10000 });
-  });
-
-  $('set-copyselect').addEventListener('change', function () {
-    app.saveSettings({ copyOnSelect: this.checked });
-    setTip.className = '';
-    setTip.textContent = this.checked
-      ? '已开启：拖选文字就复制，右键直接粘贴'
-      : '已关闭：用 Ctrl+Insert 复制；右键在有选区时仍然可以复制';
   });
 
   $('set-fontsize').addEventListener('change', function () {

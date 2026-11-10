@@ -772,6 +772,12 @@ html[data-theme="light"] .pane .pane-thumb.dragging { background: #9a9a9a; }
 
 .hist-item:hover { background: var(--bg-chrome-hover); }
 
+/* 还在运行的那条点不开：光标别给"能点"的暗示，整行压暗一档，
+   右侧的删除按钮照样能点。 */
+.hist-item.busy { cursor: default; }
+.hist-item.busy .hist-icon,
+.hist-item.busy .hist-title { opacity: 0.75; }
+
 .hist-item.live .hist-title::after {
   content: "运行中";
   position: relative;

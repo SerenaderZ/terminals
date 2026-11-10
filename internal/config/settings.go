@@ -28,9 +28,6 @@ type Settings struct {
 	CursorBlink bool `json:"cursorBlink"`
 	// Scrollback 是每个窗格保留的回看行数，范围 1000..50000。
 	Scrollback int `json:"scrollback"`
-	// CopyOnSelect 表示拖选文字后自动写入剪贴板。
-	// 终端里选中文字几乎总是为了粘贴到别处，默认开启。
-	CopyOnSelect bool `json:"copyOnSelect"`
 }
 
 // 取值范围。设置页的输入框和这里的校验用同一套边界。
@@ -54,7 +51,6 @@ func Default() Settings {
 		WebGL:          true,
 		CursorBlink:    true,
 		Scrollback:     DefaultScrollback,
-		CopyOnSelect:   true,
 	}
 }
 
@@ -96,8 +92,6 @@ func (s Settings) patch(raw map[string]json.RawMessage) (Settings, error) {
 			err = json.Unmarshal(v, &out.CursorBlink)
 		case "scrollback":
 			err = json.Unmarshal(v, &out.Scrollback)
-		case "copyOnSelect":
-			err = json.Unmarshal(v, &out.CopyOnSelect)
 		default:
 			continue // 未知字段不报错
 		}

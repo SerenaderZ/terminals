@@ -12,6 +12,7 @@
  *   2. 敲下第一条命令才出现记录，标题就是那条命令
  *   3. 日志落盘、字节数、工作目录、运行中标记
  *   4. 面板能列出、能按命令名搜
+ *   4.5 还在跑的那条点不开（两条会话往同一个日志里写，回看会交错）
  *   5. 点一条 → 新标签 → 历史铺出来、shell 能接着用
  *   6. 继续敲命令 → 还是同一条记录（数量不变、字节数增长、标题不变）
  *   7. 关掉那个窗口 → 结束时间记上，并按新时间排到前面
@@ -170,6 +171,18 @@ process.on('exit', cleanup);
   });
   await sleep(250);
 
+  // 运行中的记录点不开：两条会话往同一个日志里写，回看时输出会交错。
+  const busyClass = await page.$eval('.hist-item', (e) => e.className);
+  check('运行中的行标成不可点', /\bbusy\b/.test(busyClass), busyClass);
+  const tabsBeforeBusy = await page.evaluate(() => window.__ts.app.tabs.length);
+  await page.click('.hist-item');
+  await sleep(700);
+  const tabsAfterBusy = await page.evaluate(() => window.__ts.app.tabs.length);
+  const busyBanner = await page.$eval('#banner', (e) => (e.hidden ? '' : e.textContent));
+  check('点运行中的记录不会新开标签', tabsAfterBusy === tabsBeforeBusy,
+    `${tabsBeforeBusy} → ${tabsAfterBusy}`);
+  check('点运行中的记录给出说明', /还在运行/.test(busyBanner), JSON.stringify(busyBanner));
+
   // ---------- 4. 先关掉这个窗口：时间以关闭为准 ----------
   const firstEndedProbe = async () => {
     const l = await items();
@@ -198,6 +211,15 @@ process.on('exit', cleanup);
     await page.click('#btn-history');
     await sleep(700);
   }
+  // 面板是打开状态下关掉那个窗口的，重新开一次让列表刷新回来。
+  await page.evaluate(() => {
+    const app = window.__ts.app;
+    app.closeHistoryPanel();
+    app.openHistoryPanel();
+  });
+  await sleep(800);
+  const idleClass = await page.$eval('.hist-item', (e) => e.className);
+  check('关掉之后这一行恢复可点', !/\bbusy\b/.test(idleClass), idleClass);
   const beforeTabs = await page.evaluate(() => window.__ts.app.tabs.length);
   await page.click('.hist-item');
   await sleep(1400);

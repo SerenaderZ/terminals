@@ -99,10 +99,13 @@
 
         <div class="set-group">
           <div class="set-group-title">终端行为</div>
-          <label class="set-row">
-            <span class="set-label">选中即复制<em>拖选文字直接进剪贴板；右键在有选区时复制、没选区时粘贴</em></span>
-            <input id="set-copyselect" type="checkbox" class="switch">
-          </label>
+          <div class="set-note">
+            <span class="set-note-title">复制与粘贴</span>
+            <span class="set-note-text">
+              拖选文字不会自动复制：想复制就<b>右键</b>（或 <kbd>Ctrl</kbd>+<kbd>Insert</kbd>），选中的那段会进剪贴板；没有选区时右键是<b>粘贴</b>。
+              这样拖错了、左键点一下取消，什么都不会被复制。
+            </span>
+          </div>
           <div class="set-note">
             <span class="set-note-title">把程序留在后台</span>
             <span class="set-note-text">
@@ -185,7 +188,7 @@
       <div id="hist-list"></div>
       <div id="hist-foot">
         <span id="hist-count"></span>
-        <span id="hist-hint">点一条会在新标签里打开</span>
+        <span id="hist-hint">点一条会在新标签里打开 · 运行中的不行</span>
       </div>
     </div>
   </div>
