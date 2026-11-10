@@ -188,6 +188,13 @@ type Session struct {
 	// 前端只回放这一段；再往后是新 shell 的启动输出。
 	histStart   int64
 	histResumed bool
+	// histQuiet 表示"这段输出先别写进日志"。
+	//
+	// 接手一条老记录时会打开：新 shell 的欢迎语、以及前端为了让用户看到
+	// 提示符而补的那个回车，都不属于用户的任何一次操作。不拦的话，每次
+	// 点开历史再关掉，日志里就多一行 eason@host:~$ —— 点几次长几行。
+	// 等用户真的敲下一条命令，它才转成 false，从那一刻起照常记账。
+	histQuiet bool
 
 	writeMu sync.Mutex
 
@@ -311,6 +318,10 @@ func newSession(cfg Config, id, histID string, cols, rows int) (*Session, error)
 			s.histNamed = true
 			s.histStart = start
 			s.histResumed = true
+			// 先别往老记录里写：接下来这一秒的输出（欢迎语、以及前端补的
+			// 那个回车换来的提示符）都是打开动作的副产物，不是用户干的事。
+			// 见 histQuiet 的说明。
+			s.histQuiet = true
 		}
 	}
 
@@ -515,6 +526,12 @@ func (s *Session) histRecord(chunk []byte) {
 		return
 	}
 	s.histMu.Lock()
+	if s.histQuiet {
+		// 接手老记录、用户还没敲过东西：这段输出直接丢掉。不缓存 ——
+		// 它包含清屏序列，下次回放时会把铺好的历史擦掉。
+		s.histMu.Unlock()
+		return
+	}
 	if !s.histNamed {
 		if len(s.histBuf) < histBufCap {
 			s.histBuf = append(s.histBuf, chunk...)
@@ -531,14 +548,18 @@ func (s *Session) histRecord(chunk []byte) {
 //
 // 一旦定名就开一条记录，并把定名前攒下的输出补在最前面 —— 这样日志的开头
 // 仍然是 shell 的欢迎语和第一条提示符，而不是半截命令。
+//
+// 接手老记录的会话（histQuiet）走另一条路：名字沿用老的，不用再定；这里
+// 只负责认出"用户终于敲了第一条真命令"，把闸门打开。
 func (s *Session) histNameFromInput(p []byte) {
 	if s.cfg.History == nil {
 		return
 	}
 	s.histMu.Lock()
 	named := s.histNamed
+	quiet := s.histQuiet
 	s.histMu.Unlock()
-	if named {
+	if named && !quiet {
 		return
 	}
 	cmd, ok := s.histCmd.Scan(p)
@@ -549,6 +570,12 @@ func (s *Session) histNameFromInput(p []byte) {
 	h := s.cfg.History
 	s.histMu.Lock()
 	defer s.histMu.Unlock()
+	if quiet {
+		// 从这一步开始，回显的命令和它的输出才进日志。之前那一行提示符
+		// 不再补写：老记录的末尾本来就是上一次留下的提示符，接得上。
+		s.histQuiet = false
+		return
+	}
 	if s.histNamed { // 并发下只认第一条
 		return
 	}

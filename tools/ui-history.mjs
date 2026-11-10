@@ -91,6 +91,14 @@ process.on('exit', cleanup);
     return (j && j.ok && j.data && j.data.items) || [];
   };
 
+  // 日志文件现在多大。用下发接口的 X-History-Total，不依赖索引里那个
+  // 只在落盘时才刷新的 bytes。
+  const logTotal = (id) => page.evaluate(async (i) => {
+    const r = await fetch('api/history/' + encodeURIComponent(i) + '/log');
+    await r.text();
+    return Number(r.headers.get('X-History-Total') || 0);
+  }, id);
+
   const type = (cmd) => page.evaluate((c) => {
     window.__ts.app.activePane().session.send(1, new TextEncoder().encode(c));
   }, cmd);
@@ -226,6 +234,14 @@ process.on('exit', cleanup);
   const afterTabs = await page.evaluate(() => window.__ts.app.tabs.length);
   check('点一条会新开一个标签', afterTabs === beforeTabs + 1, `${beforeTabs} → ${afterTabs}`);
 
+  // 打开动作本身不能往日志里写东西：新 shell 的欢迎语、以及为了让用户看到
+  // 提示符补的那个回车，都是打开动作的副产物。不拦的话，点开几次就多几行
+  // eason@host:~$ —— 用户报的正是这个。
+  const totalOpen = await logTotal(rec.id);
+  await sleep(1800);
+  const totalIdle = await logTotal(rec.id);
+  check('只打开不操作，日志不长一个字节', totalIdle === totalOpen, `${totalOpen} → ${totalIdle}`);
+
   let restored = '';
   for (let i = 0; i < 40; i++) {
     restored = await termText(afterTabs - 1);
@@ -264,6 +280,24 @@ process.on('exit', cleanup);
   }
   check('再次关闭会把时间往后推', !!again, again ? `ended=${again.ended}` : '没等到');
   check('两次使用仍然只有一条记录', (await items()).length === 1);
+
+  // 关掉再点开一次：日志还是不该动。
+  if (await page.$eval('#hist-panel', (e) => e.hidden)) {
+    await page.click('#btn-history');
+    await sleep(600);
+  }
+  const totalBeforeReopen = await logTotal(rec.id);
+  await page.click('.hist-item');
+  await sleep(2400);
+  const totalAfterReopen = await logTotal(rec.id);
+  check('再点开一次仍然一个字节都不长', totalAfterReopen === totalBeforeReopen,
+    `${totalBeforeReopen} → ${totalAfterReopen}`);
+  await page.evaluate(() => {
+    const app = window.__ts.app;
+    const t = app.tabs[app.tabs.length - 1];
+    app.killPane(t.activePane());
+  });
+  await sleep(1200);
 
   // ---------- 7. 删除单条 ----------
   if (await page.$eval('#hist-panel', (e) => e.hidden)) {
