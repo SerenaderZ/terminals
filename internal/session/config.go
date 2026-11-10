@@ -7,7 +7,7 @@ import (
 )
 
 // Version 是协议与实现版本，会随 READY 帧发给前端。
-const Version = "0.3.0"
+const Version = "0.3.1"
 
 // Config 是会话管理器的配置。
 type Config struct {
