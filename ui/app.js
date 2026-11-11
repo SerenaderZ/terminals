@@ -886,7 +886,9 @@
         e.preventDefault();
         self.copyText(text);
         self.clearSelection();
-        banner('已复制 ' + text.length + ' 个字符', 'ok');
+        if (text.trim()) banner('已复制 ' + text.length + ' 个字符', 'ok');
+        // 纯空白选区：复制到的是换行，"字符"听起来像哪里出错了
+        else banner('已复制 ' + (text.split('\n').length - 1) + ' 个空行', 'ok');
         return;
       }
 
@@ -1956,8 +1958,17 @@
       out.push(raw ? s : s.replace(/[\s\u200b\ufeff]+$/, ''));
     }
     var text = out.join('\n');
-    // 末尾的换行去掉：粘贴时它只会多顶出一个空白行。raw 通道保留原样。
-    return raw ? text : text.replace(/\s+$/, '');
+    if (raw) return text;
+    // 末尾的换行去掉：粘贴时它只会多顶出一个空白行。
+    var trimmed = text.replace(/\s+$/, '');
+    if (trimmed) return trimmed;
+    // 整块选区都是空白（用户拉了一个空行下来）时不能裁成空串。
+    //
+    // Windows 终端里把空行选中复制，粘出去就是一个换行；这里返回空串会被
+    // 上层当成"没选中" —— 右键落到粘贴上、拖完的设置里选区也当场被收掉，
+    // 等于"复制一个空行"这个动作根本不存在。所以按行数给换行：N 行给
+    // N-1 个（和带文字的选区同一套算法），只选一行也给一个，保证有结果。
+    return '\n'.repeat(Math.max(1, out.length - 1));
   };
 
   Session.prototype.paintSelection = function () {
