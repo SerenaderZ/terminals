@@ -1,7 +1,6 @@
 package session
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -192,18 +191,13 @@ type Session struct {
 	// histQuiet 表示"这段输出先别写进日志"。
 	//
 	// 接手一条老记录时会打开：新 shell 的欢迎语、以及前端为了让用户看到
-	// 提示符而补的那个回车，都不属于用户的任何一次操作。不拦的话，每次
-	// 点开历史再关掉，日志里就多一行 eason@host:~$ —— 点几次长几行。
-	// 等用户真的敲下一条命令，它才转成 false，从那一刻起照常记账。
-	histQuiet bool
-	// histTail 是静默期最近的输出，只留最后 histTailCap 个字节。
+	// 提示符而补的那个回车（走 WriteQuiet，不算用户操作），都不属于用户的
+	// 任何一次操作。不拦的话，每次点开历史再关掉，日志里就多一行
+	// eason@host:~$ —— 点几次长几行。
 	//
-	// 它唯一的用途是解除静默时把"用户敲的那行命令的回显"补回来。回显是
-	// shell 打出来的输出，比回车早到 —— 用户敲的每个字都在静默期被丢掉，
-	// 只剩回车之后 shell 的回报，回看时就是一行空白后面直接跟着
-	// "bash: 114514: command not found"。上限很小：静默期本来就只覆盖
-	// 开机那几屏，留尾巴是为了定位，不是为了回放。
-	histTail []byte
+	// 人一动手就关掉：敲字、回车、退格都算（见 histNameFromInput）。
+	// 从那一刻起，回显和输出全部照常记账。
+	histQuiet bool
 
 	writeMu sync.Mutex
 
@@ -512,10 +506,25 @@ func (s *Session) Detach(c *Client) {
 
 // Write 把浏览器输入写进 PTY。
 func (s *Session) Write(p []byte) error {
+	return s.write(p, false)
+}
+
+// WriteQuiet 写输入，但不当成"用户操作"。
+//
+// 只有一个调用方：前端铺完一条历史后补的那个回车 —— 它只是为了让 shell
+// 重新打一遍提示符，不是用户按的。要是照普通输入处理，接手一条老记录时
+// 就会立刻解除静默，把这次打开动作刷出来的提示符写进日志，点几次多几行。
+func (s *Session) WriteQuiet(p []byte) error {
+	return s.write(p, true)
+}
+
+func (s *Session) write(p []byte, quiet bool) error {
 	if len(p) == 0 {
 		return nil
 	}
-	s.histNameFromInput(p)
+	if !quiet {
+		s.histNameFromInput(p)
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_, err := s.proc.Write(p)
@@ -525,22 +534,6 @@ func (s *Session) Write(p []byte) error {
 // 定名前最多攒这么多输出。正常 shell 在第一条命令之前只吐几百字节，
 // 512KB 足够兜住一屏登录脚本；再多就只保留前半段，绝不无限吃内存。
 const histBufCap = 512 << 10
-
-// histTailCap 是静默期尾巴的大小。开机那几屏加上一行提示符远到不了 8KB，
-// 而如果用户接手后一直不敲命令、让程序在自己刷屏，尾巴也只是固定开销。
-const histTailCap = 8 << 10
-
-// tailAppend 把 chunk 接到 buf 末尾，只保留最后 max 个字节。
-func tailAppend(buf, chunk []byte, max int) []byte {
-	if len(chunk) >= max {
-		return append(buf[:0], chunk[len(chunk)-max:]...)
-	}
-	buf = append(buf, chunk...)
-	if n := len(buf) - max; n > 0 {
-		buf = append(buf[:0], buf[n:]...)
-	}
-	return buf
-}
 
 // histRecord 把一块输出记进历史。
 //
@@ -552,9 +545,8 @@ func (s *Session) histRecord(chunk []byte) {
 	}
 	s.histMu.Lock()
 	if s.histQuiet {
-		// 接手老记录、用户还没敲过东西：这段输出不落盘。只留最后一个尾巴，
-		// 解除静默时用它把命令回显补回来（见 histNameFromInput）。
-		s.histTail = tailAppend(s.histTail, chunk, histTailCap)
+		// 接手老记录、人还没动手：这段输出不落盘。开着的时候会一直吞，
+		// 直到 histNameFromInput 看见第一个真实按键。
 		s.histMu.Unlock()
 		return
 	}
@@ -576,7 +568,13 @@ func (s *Session) histRecord(chunk []byte) {
 // 仍然是 shell 的欢迎语和第一条提示符，而不是半截命令。
 //
 // 接手老记录的会话（histQuiet）走另一条路：名字沿用老的，不用再定；这里
-// 只负责认出"用户终于敲了第一条真命令"，把闸门打开。
+// 只负责认出"人终于动手了"，把闸门打开。
+//
+// "动手"不等于"敲完一条命令"：敲了个空回车、按了退格、输了半行还没回车，
+// 都算。以前只认完整的命令，于是接手之后连着敲几个空行、再敲一条命令，
+// 前面那几个空行永远进不了日志 —— 用户回看时就是"我明明敲了，怎么没有了"。
+// 而 xterm 自己的自动应答（程序发查询、终端按规矩答）不算，那条路上没有
+// 真实按键，全是转义序列。
 func (s *Session) histNameFromInput(p []byte) {
 	if s.cfg.History == nil {
 		return
@@ -589,6 +587,20 @@ func (s *Session) histNameFromInput(p []byte) {
 		return
 	}
 	cmd, ok := s.histCmd.Scan(p)
+	acted := s.histCmd.Acted()
+
+	if quiet {
+		// 闸门从这里打开。之后 shell 回显的这行命令、它的输出、下一行
+		// 提示符，全都照常进日志 —— 所以不需要再"从尾巴里捞回显"了：
+		// 解除发生在写进 PTY 之前，回显一定在解除之后到达。
+		if !ok && !acted {
+			return
+		}
+		s.histMu.Lock()
+		s.histQuiet = false
+		s.histMu.Unlock()
+		return
+	}
 	if !ok {
 		return
 	}
@@ -596,25 +608,6 @@ func (s *Session) histNameFromInput(p []byte) {
 	h := s.cfg.History
 	s.histMu.Lock()
 	defer s.histMu.Unlock()
-	if quiet {
-		// 从这一步开始，回显的命令和它的输出才进日志。
-		//
-		// 但命令本身（用户敲的那几个字）是 shell 回显出来的，它比这一下
-		// 回车早到，刚才被静默期丢掉了 —— 不补回去，回看时就是一行空白
-		// 后面直接跟着 "bash: 114514: command not found"。补法是在静默期
-		// 留下的尾巴里找这行命令最后一次出现的位置，从那里原样接上：
-		// 只搬用真的回显过的字节，不会凭空造出用户没打过的字（密码提示
-		// 那种不回显的输入自然找不到，也就什么都不补）。
-		//
-		// 那行提示符仍然不补：老记录的末尾本来就是上一次留下的提示符，
-		// 接上命令正好是 "eason@host:~$ ls"。
-		s.histQuiet = false
-		if i := bytes.LastIndex(s.histTail, []byte(cmd)); i >= 0 {
-			h.Append(s.histID, s.histTail[i:])
-		}
-		s.histTail = nil
-		return
-	}
 	if s.histNamed { // 并发下只认第一条
 		return
 	}

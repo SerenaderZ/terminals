@@ -298,6 +298,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		switch data[0] {
 		case proto.KindInput:
 			_ = sess.Write(data[1:])
+		case proto.KindQuietInput:
+			// 前端为了重画提示符补的那个回车。字节照写，但别当成用户操作 ——
+			// 否则"点开历史"这个动作本身就会往日志里添一行提示符。
+			_ = sess.WriteQuiet(data[1:])
 		case proto.KindResize:
 			var rs struct {
 				Cols int `json:"cols"`

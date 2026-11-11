@@ -9,7 +9,7 @@
   'use strict';
 
   // 与服务端 internal/proto 一一对应
-  var C = { INPUT: 0x01, RESIZE: 0x02, SIGNAL: 0x03, ACK: 0x04 };
+  var C = { INPUT: 0x01, RESIZE: 0x02, SIGNAL: 0x03, ACK: 0x04, QUIET: 0x05 };
   var S = { OUTPUT: 0x01, EXIT: 0x02, READY: 0x03, ERROR: 0x04, CREDIT: 0x05, REVOKED: 0x06 };
 
   var BASE = location.pathname.endsWith('/')
@@ -1658,7 +1658,11 @@
           // 历史铺完了，可 shell 的提示符在上一步的 reset 里被清掉了。
           // 敲一个空行让它自己重画 —— 不要用 term.write 伪造一个提示符：
           // 真实提示符带 git 分支、虚拟环境、conda 那些，伪造的迟早对不上。
-          self.send(C.INPUT, new Uint8Array([13]));
+          //
+          // 这一个回车走 QUIET：它是我们补的，不是用户按的。走普通 INPUT 的话
+          // 服务端会认定"人动手了"，静默期当场结束，于是每点开一次历史就多
+          // 一行提示符 —— 正是 0.4.3 修掉的那个毛病。
+          self.send(C.QUIET, new Uint8Array([13]));
         });
       })
       .catch(function () { /* 拿不到历史就当作一个普通的新标签 */ });
@@ -3476,6 +3480,19 @@
     return out;
   };
 
+  // visible 判断一个窗格眼下是不是真在屏幕上。
+  //
+  // 隐藏标签页里的窗格会一直停在"连接中"：它们要等到自己被切出来、量到
+  // 真实尺寸之后才建连（见 waitLayout）。这个状态不是故障，可状态灯是
+  // 按所有窗格汇总的 —— 于是只要有一个没被切出来过的标签，整个界面就
+  // 永远黄灯"连接中"，而眼前的终端明明好好的，命令还能敲。
+  //
+  // offsetParent 为 null 就说明祖先里有 display:none（.tabview.hidden）。
+  Workspace.prototype.paneVisible = function (p) {
+    if (!p || !p.el) return false;
+    return !!p.el.offsetParent && p.el.getClientRects().length > 0;
+  };
+
   Workspace.prototype.connState = function () {
     var panes = this.connPanes();
     if (!panes.length) return 'online';    // 还没有窗格，不该报警
@@ -3485,7 +3502,7 @@
       var s = panes[i].el.dataset.state;
       if (s === 'offline') offline++;
       else if (s === 'online') online++;
-      else connecting++;
+      else if (this.paneVisible(panes[i])) connecting++;  // 藏着的还没轮到它连
     }
 
     if (offline && online) return 'partial';   // 分屏时一格断、一格好
@@ -3538,12 +3555,15 @@
   // 全都正常时返回 null。
   Workspace.prototype.connIssue = function () {
     var active = this.activePane();
+    var self = this;
     var best = null, bestScore = -1;
 
     this.eachSession(function (st, p) {
       if (st.disposed || st.exited || !p.el) return;
       var state = p.el.dataset.state;
       if (state === 'online') return;
+      // 藏着的窗格还没轮到它建连（见 paneVisible），不该拿去解释故障。
+      if (state !== 'offline' && !self.paneVisible(p)) return;
       var score = (p === active ? 4 : 0) + (state === 'offline' ? 2 : 0);
       if (score > bestScore) { bestScore = score; best = st; }
     });

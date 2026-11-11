@@ -335,6 +335,66 @@ func TestBeginRejectsBadID(t *testing.T) {
 	}
 }
 
+// TestAppendReopensClosedHandle 锁住"句柄丢了也要接着写"。
+//
+// 用户报的现象：从历史打开一条记录，敲什么都正常，可历史里一个字节都不长；
+// 关掉标签再点开，还是原来的内容。根因是某个会话收尾时把文件关掉了，
+// 而正在写的那个会话手上只剩一个空句柄 —— 以前 Append 见到 nil 就静静
+// return，输出全丢。
+func TestAppendReopensClosedHandle(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	defer s.Close()
+
+	s.Begin(Entry{ID: "s01", Title: "old"})
+	s.Append("s01", []byte("old\n"))
+	s.End("s01", 0)
+
+	if _, ok := s.Resume("s01"); !ok {
+		t.Fatal("接手老记录失败")
+	}
+	// 模拟"另一个会话收尾把它关了"：直接从表里摘掉句柄。
+	s.mu.Lock()
+	if f := s.files["s01"]; f != nil {
+		_ = f.Close()
+		delete(s.files, "s01")
+	}
+	s.mu.Unlock()
+
+	s.Append("s01", []byte("after\n"))
+
+	p, _ := s.LogPath("s01")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("读日志失败：%v", err)
+	}
+	if string(b) != "old\nafter\n" {
+		t.Fatalf("日志 = %q，期望接着写下去", string(b))
+	}
+	if e, ok := s.Get("s01"); ok && e.Bytes != int64(len("old\nafter\n")) {
+		t.Errorf("字节数 = %d，期望 %d", e.Bytes, len("old\nafter\n"))
+	}
+}
+
+// 记录被删掉之后不能因为一次 Append 又把它变回来。
+func TestAppendAfterDeleteStaysDeleted(t *testing.T) {
+	dir := t.TempDir()
+	s := New(dir)
+	defer s.Close()
+
+	s.Begin(Entry{ID: "s01", Title: "x"})
+	s.Append("s01", []byte("x\n"))
+	s.Delete("s01")
+	s.Append("s01", []byte("ghost\n"))
+
+	if _, ok := s.Get("s01"); ok {
+		t.Error("删掉的记录不该被 Append 复活")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "s01.log")); !os.IsNotExist(err) {
+		t.Error("删掉的日志文件不该被重建")
+	}
+}
+
 func TestNilStoreIsSafe(t *testing.T) {
 	var s *Store
 	s.Begin(Entry{ID: "x"})

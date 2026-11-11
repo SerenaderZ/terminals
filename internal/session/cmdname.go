@@ -22,6 +22,15 @@ type cmdScanner struct {
 	esc  int
 	crlf bool
 	done bool
+	// acted 表示这段输入里有没有"用户真的按了东西"的字节。
+	//
+	// 它和"有没有认出命令"是两件事：用户可能只是敲了个空回车、按了退格，
+	// 或者敲了半行还没回车。这些都不构成一条命令，但确实是人在操作 ——
+	// 接手一条老记录时，从这一刻起就该往日志里记账了（见 histNameFromInput）。
+	//
+	// 转义序列不算：程序当年的查询（DA/DSR）会让 xterm 自动应答一串
+	// ESC[?1;0c，那是终端在说话，不是人。整段被状态机吃掉，不置这一位。
+	acted bool
 }
 
 const (
@@ -34,6 +43,7 @@ const (
 
 // Scan 吃一段用户输入，返回第一条指令（还没等到换行时返回 "", false）。
 func (c *cmdScanner) Scan(p []byte) (string, bool) {
+	c.acted = false
 	if c.done {
 		return "", false
 	}
@@ -73,14 +83,18 @@ func (c *cmdScanner) Scan(p []byte) (string, bool) {
 
 		switch b {
 		case 0x1b:
+			// ESC 只是序列的开头，本身不是"用户按了一个键" —— 自动应答
+			// 也以它开头，所以这一位不能在这里置。
 			c.esc = escStart
 			c.crlf = false
 		case '\r':
+			c.acted = true
 			c.crlf = true
 			if cmd := c.take(); cmd != "" {
 				return cmd, true
 			}
 		case '\n':
+			c.acted = true
 			// CR LF 算一次换行，不能因为多了个 LF 又"提交"一次空行。
 			if c.crlf {
 				c.crlf = false
@@ -90,10 +104,13 @@ func (c *cmdScanner) Scan(p []byte) (string, bool) {
 				return cmd, true
 			}
 		case 0x7f, 0x08:
+			c.acted = true
 			c.backspace()
 		case 0x15, 0x03: // Ctrl+U 清整行、Ctrl+C 放弃这一行
+			c.acted = true
 			c.buf = c.buf[:0]
 		default:
+			c.acted = true
 			if b >= 0x20 {
 				c.buf = append(c.buf, b)
 			}
@@ -101,6 +118,10 @@ func (c *cmdScanner) Scan(p []byte) (string, bool) {
 	}
 	return "", false
 }
+
+// Acted 报告上一次 Scan 的输入里有没有"用户真的按了东西"的字节。
+// 只对紧接着的那次 Scan 有效 —— 每次 Scan 开头都会清掉。
+func (c *cmdScanner) Acted() bool { return c.acted }
 
 // take 结掉当前这一行。有内容就当作指令返回，空行只清空缓冲。
 func (c *cmdScanner) take() string {

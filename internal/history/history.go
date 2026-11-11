@@ -294,6 +294,12 @@ func (s *Store) Resume(id string) (int64, bool) {
 //
 // 每个输出块都会走这里，所以只做两件事：写、刷新活动时间。字节数在内存里
 // 累加，索引等会话结束再落盘 —— 每 32KB 重写一遍 JSON 纯属浪费。
+//
+// 句柄不见了就重开一个。这条以前是悄悄 return，后果很严重：某个会话收尾
+// 时把文件关掉（两条会话接手同一条记录的时序竞态），正在写的那个会话从此
+// 一个字节都写不进去，而 shell 一切正常、屏幕上照旧有输有出 —— 用户看到
+// 的就是"能敲命令，但历史里什么都没记下"。宁可多开一次文件，也不能静默
+// 丢内容。
 func (s *Store) Append(id string, p []byte) {
 	if s == nil || len(p) == 0 {
 		return
@@ -301,8 +307,24 @@ func (s *Store) Append(id string, p []byte) {
 	s.mu.Lock()
 	f := s.files[id]
 	if f == nil {
-		s.mu.Unlock()
-		return
+		// 记录已被删除（用户点了 ✕ / 清空）就别再造一个文件出来。
+		if _, ok := s.idx[id]; !ok || !validID(id) {
+			s.mu.Unlock()
+			return
+		}
+		nf, err := os.OpenFile(filepath.Join(s.dir, id+".log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			s.mu.Unlock()
+			log.Printf("历史日志 %s 句柄丢了、重开也失败：%v", id, err)
+			return
+		}
+		s.files[id] = nf
+		if s.refs[id] <= 0 {
+			s.refs[id] = 1
+		}
+		log.Printf("历史日志 %s 的句柄不见了，已重新打开", id)
+		f = nf
 	}
 	n, err := f.Write(p)
 	if err == nil {
