@@ -70,6 +70,52 @@ process.on('exit', cleanup);
     await sleep(450);
   };
   const auto = () => page.evaluate(() => window.__ts.app.activeTab().autoLabel());
+  // 量一个标签的几何：编辑态要和平时的显示态严丝合缝，差一点都不行 ——
+  // 差 1px 用户看不出来，差 80px 就是整条标签栏跳一下（以前 min-width:200px
+  // 的老毛病）。
+  const metrics = (idx) => page.evaluate((i) => {
+    const t = document.querySelectorAll('.tab')[i];
+    if (!t) return null;
+    const r = t.getBoundingClientRect();
+    const sp = t.querySelector('.title');
+    const inp = t.querySelector('.tab-input');
+    const box = (el) => {
+      if (!el) return null;
+      const b = el.getBoundingClientRect();
+      return { left: b.left, top: b.top, w: b.width, h: b.height };
+    };
+    return {
+      left: r.left, w: r.width, h: r.height,
+      inlineW: t.style.width,
+      title: box(sp),
+      titleShown: !!sp && getComputedStyle(sp).display !== 'none',
+      input: box(inp),
+      stripH: document.querySelector('#tabstrip').getBoundingClientRect().height,
+    };
+  }, idx);
+
+  // ---- 0. 编辑态和显示态一样宽 ----
+  const m0 = await metrics(0);
+  const m1 = await (async () => { await dblclickTab(0); return metrics(0); })();
+  check('双击后标签宽度不变', Math.abs(m1.w - m0.w) < 0.6, `${m0.w} → ${m1.w}`);
+  check('双击后标签位置不变（没有把后面挤走）', Math.abs(m1.left - m0.left) < 0.6,
+    `${m0.left} → ${m1.left}`);
+  check('双击后标签栏高度不变', Math.abs(m1.stripH - m0.stripH) < 0.6,
+    `${m0.stripH} → ${m1.stripH}`);
+  check('输入框左边和原来的文字对齐',
+    !!m1.input && !!m0.title && Math.abs(m1.input.left - m0.title.left) < 0.8,
+    `title=${m0.title && m0.title.left} input=${m1.input && m1.input.left}`);
+  check('输入框宽度就是原来文字那块',
+    !!m1.input && !!m0.title && Math.abs(m1.input.w - m0.title.w) < 1.2,
+    `title=${m0.title && m0.title.w} input=${m1.input && m1.input.w}`);
+  check('输入框垂直位置和文字一致',
+    !!m1.input && !!m0.title && Math.abs(m1.input.top - m0.title.top) < 2,
+    `title=${m0.title && m0.title.top} input=${m1.input && m1.input.top}`);
+  await page.keyboard.press('Escape');
+  await sleep(300);
+  const m2 = await metrics(0);
+  check('退出编辑后没有留下内联宽度', m2.inlineW === '', JSON.stringify(m2.inlineW));
+  check('退出编辑后宽度回到内容决定', Math.abs(m2.w - m0.w) < 0.6, `${m0.w} → ${m2.w}`);
 
   // ---- 1. 双击进编辑 ----
   const before = await label();
@@ -155,6 +201,21 @@ process.on('exit', cleanup);
   await sleep(350);
   const long = (await labels())[1];
   check('超长名字截断到 40 字', long.length === 40, `len=${long.length}`);
+
+  // ---- 10. 标签多的时候，编辑中间那个不推挤后面的 ----
+  await page.evaluate(() => window.__ts.app.newTab(true));
+  await sleep(1200);
+  await page.evaluate(() => window.__ts.app.activateTab(window.__ts.app.tabs[0].id));
+  await sleep(500);
+  const n = await page.evaluate(() => document.querySelectorAll('.tab').length);
+  check('现在有三个标签', n === 3, `n=${n}`);
+  const mLast0 = await metrics(2);
+  await dblclickTab(1);
+  const mLast1 = await metrics(2);
+  check('编辑中间标签时，最后一个标签没被推走',
+    Math.abs(mLast1.left - mLast0.left) < 0.6, `${mLast0.left} → ${mLast1.left}`);
+  await page.keyboard.press('Escape');
+  await sleep(250);
 
   console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
   await browser.disconnect();

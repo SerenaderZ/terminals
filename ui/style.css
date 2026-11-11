@@ -121,23 +121,25 @@ body {
 }
 
 /* 双击标签后替换掉 .title 的输入框。
-   .title 是 flex:1 / basis 0，标签平时就停在 min-width 120px，编辑时给宽一点，
-   否则输入框里只看得到六七个字。改完移除类名，宽度自己回去。 */
-.tab.renaming {
-  min-width: 200px;
-}
-
+   编辑态必须和平时一模一样宽。以前这里给 .renaming 加 min-width: 200px，
+   双击的瞬间标签宽出一大截、把后面所有标签往右挤 —— 标签一多整条栏就跳
+   一下，改完再跳回来。现在宽度在 beginRename 里按当时的实际宽度锁死，
+   输入框自己撑满这一块；边框改用 outline（不占布局）、padding 归零，
+   于是文字起点和 .title 完全重合，看不出换了个元素。 */
 .tab .tab-input {
   flex: 1;
   min-width: 0;
-  border: 1px solid var(--accent);
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: 0;
   border-radius: 3px;
   background: var(--bg);
   color: var(--fg);
   font: inherit;
-  line-height: 1.2;
-  padding: 1px 4px;
-  outline: none;
+  line-height: inherit;
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
   user-select: text;
 }
 

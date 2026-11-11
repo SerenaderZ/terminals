@@ -2269,8 +2269,20 @@
     input.value = this.label();
     input.setAttribute('aria-label', '工作区名称');
 
+    // 宽度按"现在多宽"锁死，编辑态和显示态一模一样。
+    //
+    // 不锁的话会被 CSS 的 min-width 或内容宽度改变：以前编辑时把 min-width
+    // 抬到 200px，双击的瞬间这个标签宽出一截，后面所有标签全被挤走，标签一
+    // 多就是整条标签栏跳一下，改完再跳回来。宽度只在这一段输入期间固定，
+    // 结束时三个内联样式一起清掉，标签自己回到内容撑开的宽度。
+    var w = this.el.getBoundingClientRect().width;
     span.style.display = 'none';
     this.el.classList.add('renaming');
+    if (w > 0) {
+      this.el.style.width = w + 'px';
+      this.el.style.minWidth = w + 'px';
+      this.el.style.maxWidth = w + 'px';
+    }
     this.el.insertBefore(input, span);
 
     var done = false;
@@ -2280,6 +2292,9 @@
       input.remove();
       span.style.display = '';
       self.el.classList.remove('renaming');
+      self.el.style.width = '';
+      self.el.style.minWidth = '';
+      self.el.style.maxWidth = '';
       if (!commit) return;
 
       // 折成一行、去掉首尾空白，再按长度截断 —— 换行会把标签撑成两行。
