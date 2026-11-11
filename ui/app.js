@@ -660,6 +660,8 @@
     this.replaying = false;
     this.replayPending = 0;
     this.replayTimer = 0;
+    // 回放期间挡住鼠标/焦点追踪开关的那几个处理器（见 guardReplayModes）。
+    this.replayGuards = [];
     // 滚轮增量的余量，攒够 40px 走一行（触摸板的小增量靠它才滚得动）。
     this.wheelAcc = 0;
     // 最近一次连接失败的原因与关闭码。状态栏那个按钮的悬停说明全靠它，
@@ -1662,6 +1664,50 @@
       .catch(function () { /* 拿不到历史就当作一个普通的新标签 */ });
   };
 
+  // guardReplayModes 在回放历史期间挡住"鼠标/焦点追踪"这类模式开关。
+  //
+  // 历史日志里留着程序当时发出的 \x1b[?1003h —— Claude Code 这类全屏程序
+  // 一进来就把鼠标追踪打开。回放是原样重演，xterm 照着把鼠标报告也打开；
+  // 可回放完接手的是刚起来的 shell，它根本不要鼠标报告，于是鼠标一动就往
+  // 命令行里灌一串 "35;98;8M"（SGR 报告被 shell 当输入），屏幕上看起来就是
+  // 不停地冒出乱码，而且和焦点在哪个标签无关 —— 报告是终端自己发的。
+  //
+  // 只挡这几个模式：SGR、光标移动、擦除这些照常放行，回放的画面才对。
+  Session.prototype.guardReplayModes = function () {
+    this.releaseReplayModes();
+    var term = this.term;
+    if (!term || !term.parser || !term.parser.registerCsiHandler) return;
+    var modes = {
+      9: 1, 1000: 1, 1002: 1, 1003: 1, 1004: 1,
+      1005: 1, 1006: 1, 1015: 1, 1016: 1,
+      // bracketed paste 也一起挡：历史里留着 ?2004h 的话，回放之后 term.paste
+      // 会把内容包上 \x1b[200~，而对面那个 shell 自己没开这个模式，粘贴出来的
+      // 文字前头就多一截转义字符。
+      2004: 1,
+    };
+    var block = function (params) {
+      for (var i = 0; i < params.length; i++) {
+        var p = params[i];
+        var n = Array.isArray(p) ? p[0] : p;
+        if (typeof n === 'number' && modes[n]) return true;
+      }
+      return false;
+    };
+    var self = this;
+    ['h', 'l'].forEach(function (fin) {
+      try {
+        self.replayGuards.push(term.parser.registerCsiHandler({ prefix: '?', final: fin }, block));
+      } catch (e) { /* 老版本没有这个接口，靠 writeHistory 收尾时的兜底 */ }
+    });
+  };
+
+  Session.prototype.releaseReplayModes = function () {
+    for (var i = 0; i < this.replayGuards.length; i++) {
+      try { this.replayGuards[i].dispose(); } catch (e) { }
+    }
+    this.replayGuards = [];
+  };
+
   // writeHistory 把一条历史记录铺进终端。写完调用 done。
   //
   // 三件事必须做对：
@@ -1675,6 +1721,15 @@
     var self = this;
     var fin = function () {
       self.replaying = false;
+      self.releaseReplayModes();
+      // 兜底关掉鼠标/焦点追踪：拦截器没装上（老 xterm）或者历史里用了个
+      // 没列到的模式号时，至少保证回放结束后不会继续把鼠标移动当输入发。
+      try {
+        if (self.term) {
+          self.term.write('\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l' +
+            '\x1b[?1006l\x1b[?2004l\x1b[?25h');
+        }
+      } catch (e) { }
       clearTimeout(self.historyTimer);
       self.paintAll();
       if (done) done();
@@ -1683,6 +1738,7 @@
 
     this.term.reset();
     this.replaying = true;
+    this.guardReplayModes();
     clearTimeout(this.historyTimer);
     // 兜底：万一某个 write 回调没回来，别把键盘永久锁死。
     this.historyTimer = setTimeout(function () { self.replaying = false; }, 30000);
