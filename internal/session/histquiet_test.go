@@ -178,3 +178,27 @@ func readLog(t *testing.T, p string) string {
 	}
 	return string(b)
 }
+
+// TestReadyCarriesHistoryID 锁住"刷新页面之后前端找得到那条历史"。
+//
+// 前端布局里只存 sid，历史文件是哪一条只有服务端知道。刷新页面之后要靠
+// READY 里这个 histId 把日志重新铺回屏幕上 —— 少了它，屏幕上就只剩接手
+// 之后敲的那几行。
+func TestReadyCarriesHistoryID(t *testing.T) {
+	start := int64(411)
+	s := &Session{ID: "sNew", histID: "sOld", histResumed: true, histStart: start}
+	r := s.Ready(false, false, 0, false, false)
+	if r.HistID != "sOld" {
+		t.Fatalf("HistID = %q，期望 sOld", r.HistID)
+	}
+	if r.HistStart == nil || *r.HistStart != start {
+		t.Fatalf("HistStart = %v，期望 %d", r.HistStart, start)
+	}
+
+	// 普通会话有自己的日志 id（写日志时用），但那是"当前这一屏"的记录，
+	// 不该发出去让前端拿它重铺屏幕。
+	plain := &Session{ID: "sPlain", histID: "sPlain"}
+	if got := plain.Ready(false, false, 0, false, false).HistID; got != "" {
+		t.Fatalf("普通会话不该带 HistID，得到 %q", got)
+	}
+}

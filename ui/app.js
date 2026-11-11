@@ -206,6 +206,32 @@
     return (n / 1024 / 1024).toFixed(1) + ' MB';
   }
 
+  // splitBoot 把一段回放的"启动清屏"和"画面内容"分开。
+  //
+  // 接手一条老记录时，回放开头是一串只改状态、不上屏的字节：服务端自己加
+  // 的复位前缀（ESC[0m ESC[?7h ESC[H ESC[2J ESC[3J），紧接着是新 shell 的
+  // 启动输出（PowerShell 还会打几十个空行把屏幕腾出来，里面又带一次清屏）。
+  // 这段必须先单独执行掉 —— 直接接在历史后面写，那几下清零就把刚铺好的
+  // 历史擦没了。
+  //
+  // 做法是从头一路吃掉"看不见的"字节，直到第一个会显示出来的字符为止；
+  // 中途见过清屏（ED 2 / ED 3）才认为这一段是启动清屏，否则整段都算内容
+  // （bash 起来通常就是这种情况，前面直接是提示符）。
+  function splitBoot(s) {
+    if (!s) return { head: '', rest: '' };
+    var invis = /^(?:\x1b\[[0-9;?]*[HfJmKhl]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\r\n]|\x07)/;
+    var i = 0, sawClear = false;
+    // 上限只是防呆：正常启动输出也就几十截。
+    for (var k = 0; k < 4000; k++) {
+      var mm = invis.exec(s.slice(i, i + 4096));
+      if (!mm) break;
+      if (mm[0].indexOf('J') >= 0) sawClear = true;
+      i += mm[0].length;
+    }
+    if (!sawClear) return { head: '', rest: s };
+    return { head: s.slice(0, i), rest: s.slice(i) };
+  }
+
   // shortTitle 把"程序给自己设的窗口标题"收拾成能放进标签栏的样子。
   //
   // 只处理一种情况：整个标题就是一个路径（盘符或 / 开头、没有空格）。
@@ -647,6 +673,18 @@
     this.historyText = null;
     this.historyLoaded = false;
     this.historyTimer = 0;
+    // 重连回一条"接着老记录写"的会话时要整段重铺（见 stitchResume）。
+    // histHold 暂存重铺期间到达的实时输出：铺的开头会 reset 一次屏幕，
+    // 先到的那些字会被抹掉，先攥在手里，铺完再按原顺序补回去。
+    this.histRendering = false;
+    this.histHold = [];
+    // 重铺历史时先把服务端回放攥在手里（captureReplay / replayText），
+    // histTok 用来作废已经过期的那次重铺，histTimer 是它的兜底。
+    this.captureReplay = false;
+    this.replayText = null;
+    this.replayDec = null;
+    this.histTok = 0;
+    this.histTimer = 0;
     // 回放期间不要把终端的"自动应答"发回 PTY。
     //
     // 回放是把历史输出重演一遍，而历史里可能有程序当初发出的查询序列
@@ -759,6 +797,16 @@
         self.widthFixes += 1;
         self.replayCols = 0;
         self.reloadForWidth();
+        return;
+      }
+      // 和 PTY 现在的大小一样就别发了。
+      //
+      // TIOCSWINSZ 不管宽高有没有变，都会给前台进程拍一个 SIGWINCH；
+      // 全屏程序（以及 Windows 上的 PowerShell）收到就整屏重绘一遍。
+      // 刷新页面时窗口尺寸通常没变，这一下白来的重绘会从屏幕左上角开始
+      // 重画，把刚铺好的历史整片盖掉 —— 看起来正是"历史又没了"。
+      if (self.ptyCols === size.cols && self.ptyRows === size.rows) {
+        self.opts.onScroll && self.opts.onScroll();
         return;
       }
       self.sendResize(size.cols, size.rows);
@@ -1347,9 +1395,11 @@
       self.lastError = '';
       self.lastCode = 0;
       self.setState('online');
-      // 同理：只有 fit 过才报尺寸。没 fit 时报上去的是默认 80x24，
-      // 服务端照着改一次 PTY 就多一次 SIGWINCH。
-      if (self.term && self.fitted) self.sendResize(self.term.cols, self.term.rows);
+      // 这里不再无条件报一次尺寸：新建会话本身就是按 URL 里的 cols/rows
+      // 起的 PTY，重连的会话则已经有一块 PTY，两种情况下这一报基本都是
+      // "同尺寸的空操作"。而 TIOCSWINSZ 即使尺寸没变也会给前台进程一个
+      // SIGWINCH，PowerShell 这类程序收到就整屏重绘，刷新页面时会把刚铺
+      // 好的历史盖掉。真不一致时 READY 那边会对账（见下面的尺寸对账）。
     };
 
     ws.onmessage = function (ev) {
@@ -1368,8 +1418,17 @@
             // 兜底：服务端少发一段、或长度对不上时别把键盘永久锁死。
             self.replayTimer = setTimeout(function () {
               self.replaying = false;
+              if (self.captureReplay) self.finishCapture();
               self.replayPending = 0;
             }, 3000);
+            if (self.captureReplay) {
+              // 这一屏先别画：它是"接手之后"的部分，要接在历史后面重铺
+              // 才算完整（见 stitchResume）。按字节存、全程用同一个流式
+              // 解码器，免得把跨帧的多字节字符劈成两半。
+              self.replayText += self.replayDec.decode(payload, { stream: true });
+              if (self.replayPending <= 0) self.finishCapture();
+              return;
+            }
             if (self.replayPending <= 0) {
               self.replayPending = 0;
               self.term.write(payload, function () {
@@ -1379,6 +1438,10 @@
             } else {
               self.term.write(payload);
             }
+          } else if (self.histRendering) {
+            // 正在整段重铺历史。铺的开头会 reset 一次屏幕，这会儿写下去的
+            // 字节会被抹掉，先攥着，铺完按原顺序补回去（见 endHistHold）。
+            self.histHold.push(payload);
           } else {
             self.term.write(payload);
           }
@@ -1477,6 +1540,35 @@
           }
           clearTimeout(self.historyTimer);
           self.historyTimer = setTimeout(function () { self.loadHistory(); }, 250);
+        } else if (info.histResumed && info.histId && !info.altScreen) {
+          // 刷新页面（或者关掉网页再打开）之后接回同一个会话。
+          //
+          // 布局里只存了 sid，"这条会话写着哪一份历史"只有服务端知道 ——
+          // 这次 READY 会把 histId / histStart 带过来。服务端的回放缓冲
+          // 里只有这条会话自己产生过的输出，历史那一段在会话开始之前就
+          // 写进日志了，永远进不了回放，于是刷新之后屏幕上就只剩接手之后
+          // 敲的那几行，上面的历史全没了。
+          //
+          // 回放的这一屏先攥在手里不画，等把日志里历史那一段取回来，
+          // 拼成一整段再铺（见 stitchResume）。
+          clearTimeout(self.historyTimer);
+          // 上一次重铺（如果有）作废：它的回调不该再往这块屏上写。
+          clearTimeout(self.histTimer);
+          self.histTok = (self.histTok || 0) + 1;
+          self.histHold = [];
+          self.histRendering = true;
+          if (info.replayLen > 0) {
+            self.captureReplay = true;
+            self.replayText = '';
+            self.replayDec = new TextDecoder();
+          } else {
+            // 没有回放可等（宽窄对不上被服务端跳过、或者缓冲是空的）：
+            // 直接按日志整段重铺。
+            self.captureReplay = false;
+            self.replayDec = null;
+            self.replayText = null;
+            self.stitchResume();
+          }
         }
         return;
       }
@@ -1710,6 +1802,113 @@
       try { this.replayGuards[i].dispose(); } catch (e) { }
     }
     this.replayGuards = [];
+  };
+
+  // finishCapture 收下最后一段回放字节，转去重铺。
+  Session.prototype.finishCapture = function () {
+    if (!this.captureReplay) return;
+    this.captureReplay = false;
+    this.replaying = false;
+    this.replayPending = 0;
+    clearTimeout(this.replayTimer);
+    if (this.replayDec) {
+      this.replayText += this.replayDec.decode();
+      this.replayDec = null;
+    }
+    this.stitchResume();
+  };
+
+  // stitchResume 把"老记录 + 接手之后这一屏"拼成一整段重铺回屏幕。
+  //
+  // 日志里 0..histStart 是上一次留下的内容；会话自己的那一屏已经攥在
+  // replayText 里。为什么不用日志拼后半段：接手时会静默一段时间，那会儿
+  // shell 打出来的提示符按规定不记账（不然每点开一次就多一行），所以日志
+  // 尾部反而缺了那个提示符；回放里是有的。
+  //
+  // 接法还有个细节：新 shell 的启动输出开头就是清屏，直接接在历史后面写，
+  // 那一下清零会把刚铺好的历史擦掉。所以先把它连同后面那串看不见的填空
+  // 单独写掉，再从屏幕顶部开始铺历史（见 splitBoot）。
+  Session.prototype.stitchResume = function () {
+    var self = this;
+    var info = this.lastReady || {};
+    var id = info.histId || this.opts.historyId;
+    var fresh = this.replayText;
+    this.replayText = null;
+
+    // 重铺是个异步过程（取日志 + 分块写），期间到达的实时输出先攥着。
+    this.histRendering = true;
+    var tok = this.histTok = (this.histTok || 0) + 1;
+    clearTimeout(this.histTimer);
+    // 兜底：取日志卡住时不能把实时输出一直扣着，那样终端看起来就是死的。
+    this.histTimer = setTimeout(function () {
+      if (tok !== self.histTok) return;
+      self.histTok++;
+      self.endHistHold();
+    }, 8000);
+
+    var done = function () {
+      if (tok !== self.histTok) return;
+      self.histTok++;
+      clearTimeout(self.histTimer);
+      self.endHistHold();
+    };
+    var paint = function (text) {
+      if (!text) { done(); return; }
+      self.writeHistory(text, done);
+    };
+
+    if (!id || this.disposed || !this.term) { done(); return; }
+    var only = typeof fresh === 'string';   // 有回放就只取历史那一段
+    var seam = typeof info.histStart === 'number' ? info.histStart : 0;
+    var url = API + 'history/' + encodeURIComponent(id) + '/log' + (only ? '?to=' + seam : '');
+
+    fetch(url)
+      .then(function (r) {
+        if (!r.ok) return null;
+        var total = parseInt(r.headers.get('X-History-Total') || '0', 10);
+        var off = parseInt(r.headers.get('X-History-Offset') || '0', 10);
+        return r.text().then(function (t) { return { text: t, total: total, off: off }; });
+      })
+      .then(function (res) {
+        if (tok !== self.histTok || self.disposed || !self.term) return;
+        if (!res) {
+          // 取不到日志：至少把回放那一屏画出来，别留一块空白。
+          if (only) paint(fresh); else done();
+          return;
+        }
+        var note = '';
+        if (res.off > 0) {
+          note = '\x1b[2m—— 更早的内容已省略（共 ' + fmtBytes(res.total) +
+            '，这里显示最后 ' + fmtBytes(res.total - res.off) + '）——\x1b[0m\r\n';
+        }
+        var older, post;
+        if (only) {
+          older = res.text;
+          post = fresh;
+        } else {
+          var cut = Math.max(0, Math.min(res.text.length, seam - res.off));
+          older = res.text.slice(0, cut);
+          post = res.text.slice(cut);
+        }
+        var sp = splitBoot(post);
+        paint(older
+          ? sp.head + note + older + '\r\n\x1b[2m── 以上是历史记录 ──\x1b[0m\r\n' + sp.rest
+          : note + sp.head + sp.rest);
+      })
+      .catch(function () {
+        if (tok !== self.histTok || self.disposed) return;
+        if (only) paint(fresh); else done();
+      });
+  };
+
+  // endHistHold 放开"重铺期间攒下的实时输出"，按到达顺序补回去。
+  Session.prototype.endHistHold = function () {
+    this.histRendering = false;
+    var held = this.histHold;
+    this.histHold = [];
+    for (var i = 0; i < held.length; i++) {
+      if (this.term) this.term.write(held[i]);
+    }
   };
 
   // writeHistory 把一条历史记录铺进终端。写完调用 done。
@@ -2193,6 +2392,15 @@
   Session.prototype.dispose = function () {
     this.disposed = true;
     this.focused = false;
+    // 重铺还没走完就被销毁：把攒下的实时输出丢掉，别再往一个已经
+    // dispose 过的 term 里写。
+    clearTimeout(this.histTimer);
+    this.histTok = (this.histTok || 0) + 1;
+    this.histRendering = false;
+    this.histHold = [];
+    this.captureReplay = false;
+    this.replayText = null;
+    this.replayDec = null;
     this.detachWebgl(); // 先还上下文，再销毁 term
     if (this.bufSub) { try { this.bufSub.dispose(); } catch (e) { } this.bufSub = null; }
     clearTimeout(this.retryTimer);

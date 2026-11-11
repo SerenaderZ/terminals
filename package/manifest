@@ -1,5 +1,5 @@
 appname=terminals
-version=0.5.0
+version=0.5.1
 display_name=终端
 desc=多标签、分屏、会话保活的 Web 终端。刷新页面进程不中断，布局与分屏保存在服务端，适配 Claude Code 等全屏 CLI。默认以降权账户运行，需要 root 时在终端里 sudo -i。
 maintainer=SerenaderZ

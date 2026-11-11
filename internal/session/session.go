@@ -54,7 +54,10 @@ type Ready struct {
 	// HistStart 只在"接着一条老记录"时出现：日志里前这么多字节是上一次
 	// 留下的完整内容，前端只回放这一段。再往后是新 shell 的启动输出，
 	// 其中带清屏序列，整段灌回去会把刚铺好的历史擦掉。
-	HistStart   *int64 `json:"histStart,omitempty"`
+	HistStart *int64 `json:"histStart,omitempty"`
+	// HistID 是这条会话写着的历史记录。刷新页面之后前端就靠它把日志
+	// 重新铺回屏幕上：布局里只存了 sid，历史文件是哪一条只有服务端知道。
+	HistID      string `json:"histId,omitempty"`
 	HistResumed bool   `json:"histResumed,omitempty"`
 
 	// ReplaySkipped 表示这次挂载**故意没给回放**：缓冲里的历史是在另一个
@@ -727,8 +730,19 @@ func (s *Session) Ready(inAlt, needAltEnter bool, replayLen int, truncated, skip
 		ReplayTruncated: truncated,
 		ReplaySkipped:   skipped,
 		HistStart:       s.histStartPtr(),
+		HistID:          s.histIDPtr(),
 		HistResumed:     s.histResumed,
 	}
+}
+
+// histIDPtr 只对"接手老记录"的会话给出记录 id。普通会话的 histID 是它
+// 自己那份日志的名字，前端不需要、也不该拿它去铺屏（那会把当前会话的
+// 画面整段重放一遍）。
+func (s *Session) histIDPtr() string {
+	if !s.histResumed {
+		return ""
+	}
+	return s.histID
 }
 
 // histStartPtr 只在接手老记录时给出起点，普通会话给 nil（JSON 里不出现）。
