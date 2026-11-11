@@ -2397,6 +2397,14 @@
 
     // 非安全上下文（http 直连 IP）没有 async clipboard API，
     // 退回到老办法：临时 textarea + execCommand。
+    //
+    // 这里必须先记下焦点。ta.select() 会把键盘焦点从 xterm 的隐藏输入框
+    // 抢到临时 textarea 上，removeChild 之后焦点就掉到 body —— 浏览器从此
+    // 不再把 paste 事件送给终端，Ctrl+V 按了没反应。程序自己发的 OSC 52
+    // 每次拖选都会走这里，结果就是"剪贴板明明写进去了，却怎么也粘不出来"，
+    // 看起来和完全没修一样。右键复制也同样中招，只是以前没人把这两件事
+    // 连起来看。
+    var prev = document.activeElement;
     var ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';
@@ -2407,6 +2415,12 @@
     var ok = false;
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
     document.body.removeChild(ta);
+    // 焦点原样还回去。preventScroll 不能省：终端里常滚到上面几屏看输出，
+    // focus 默认会把页面滚回输入框，一下就把用户正在看的内容挪走了。
+    if (prev && prev !== document.body && prev.focus && document.contains(prev)) {
+      try { prev.focus({ preventScroll: true }); }
+      catch (e) { try { prev.focus(); } catch (e2) { } }
+    }
     if (!ok && !quiet) banner('浏览器不允许写入剪贴板，请用 Ctrl+Insert 或系统复制', 'warn');
     // 返回真实结果：调用方（OSC 52 的回执）要如实说写没写进去，
     // 一律报 true 的话"程序复制了但剪贴板没变"这种情况就永远看不出来。

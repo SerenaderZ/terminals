@@ -312,6 +312,42 @@ try {
   console.log('SKIP  Ctrl+V 实粘（拿不到系统剪贴板）:', e.message.slice(0, 60));
 }
 
+// ---- 5. 复制绝不能把键盘焦点带走 ----
+// http 页面上写系统剪贴板只能靠临时 textarea + execCommand。ta.select()
+// 会把焦点从 xterm 的隐藏输入框抢走，removeChild 之后掉到 body：剪贴板
+// 写成功了，浏览器却从此不再把 paste 事件送给终端，Ctrl+V 按了没反应。
+// 程序自己发的 OSC 52 每次拖选都走这条路，表现就是「装了新版和没装一样」。
+const focusState = () => page.evaluate(() => {
+  const ta = document.querySelector('.pane.focused .xterm-helper-textarea');
+  return {
+    tag: document.activeElement && document.activeElement.tagName,
+    cls: document.activeElement && document.activeElement.className,
+    ok: !!ta && document.activeElement === ta,
+  };
+});
+
+await page.click('.pane.focused .terminal-host');
+await sleep(250);
+const f0 = await focusState();
+check('复制前焦点在终端输入框', f0.ok, JSON.stringify(f0));
+
+await page.evaluate(() => {
+  window.__ts.app.activePane().session.copyText('FOCUS-RIGHT-CLICK');
+});
+await sleep(250);
+const f1 = await focusState();
+check('应用内复制后焦点仍在终端输入框', f1.ok, JSON.stringify(f1));
+
+// 真正出问题的那条：程序自己发 OSC 52，序列经 xterm 的 OSC 解析器进来
+await page.evaluate(() => {
+  const s = window.__ts.app.activePane().session;
+  const b64 = btoa(String.fromCharCode(...new TextEncoder().encode('FOCUS-OSC52')));
+  s.term.write('\x1b]52;c;' + b64 + '\x07');
+});
+await sleep(400);
+const f2 = await focusState();
+check('OSC 52 复制后焦点仍在终端输入框', f2.ok, JSON.stringify(f2));
+
 await browser.close();
 child.kill();
 
