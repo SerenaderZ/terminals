@@ -167,13 +167,18 @@ const picked = await page.evaluate(() => {
     const txt = line.translateToString(true);
     const x = txt.indexOf(needle);
     if (x >= 0) {
-      st.term.select(x, y, needle.length);
-      return st.term.getSelection();
+      // 选区从 0.2.19 起由应用自己维护（selRange / rangeText），不再读
+      // xterm 的 term.getSelection()。这里直接按真实拖选那样摆好范围，
+      // 用 term.select() 造出来的选区应用看不见，右键会当成"没选中"。
+      st.selRange = { sx: x, sy: y, ex: x + needle.length, ey: y };
+      st.selSnap = null;
+      st.paintSelection();
+      return st.selectionText();
     }
   }
   return '';
 });
-check('选中了一段可识别的文字', picked === 'CLIP_INNER_5X', JSON.stringify(picked));
+check('选中了一段可识别的文字', picked.trim() === 'CLIP_INNER_5X', JSON.stringify(picked));
 
 await page.mouse.click(box.x, box.y, { button: 'right' });
 await sleep(400);
@@ -186,8 +191,11 @@ check('复制后给出提示', /已复制/.test(copyTip), copyTip);
 // 左键点一下终端，清掉选区
 await page.mouse.click(box.x + 40, box.y + 60);
 await sleep(400);
-const cleared = await page.evaluate(() => window.__ts.app.activePane().session.term.getSelection());
-check('左键点击后选区已清空', cleared === '', JSON.stringify(cleared));
+const cleared = await page.evaluate(() => {
+  const st = window.__ts.app.activePane().session;
+  return { range: !!st.selRange, text: st.selectionText() };
+});
+check('左键点击后选区已清空', !cleared.range && cleared.text === '', JSON.stringify(cleared));
 
 await page.mouse.click(box.x, box.y, { button: 'right' });
 await sleep(600);

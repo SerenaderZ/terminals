@@ -18,6 +18,12 @@
   var API = BASE + 'api/';
   var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + API + 'ws';
 
+  // 脚本自己的版本号，由服务端出站时把下面那个占位符换成本次运行的版本
+  // （见 internal/server 的 staticUI）。为什么非要埋在脚本里：光有服务端
+  // 版本回答不了"浏览器执行的到底是哪一份 app.js" —— 升级之后最常见的情况
+  // 就是服务端换了、页面还是旧的，用户在界面上一个能对照的数字都没有。
+  var BUILD = '__V__';
+
   var ACTIVE_KEY = 'terminals.active.v1';
   // 和服务端 internal/config 里的边界保持一致，否则会出现
   // "本地能调到 8，保存时被服务端打回"的割裂感。
@@ -1850,7 +1856,15 @@
         if (!data || data === '?') return true;   // 查询：不回
         var text = base64Text(data);
         if (!text) return true;
-        self.copyText(text, true);
+        // 回执：程序那边只会说"我发出去了"，剪贴板里到底有没有、有多少，
+        // 只有终端自己知道。打出来的人能拿它和程序那句 "sent N chars" 对账，
+        // 数字一致就说明这条链路是通的；什么都没出现，就是这份脚本没跑到。
+        var ok = self.copyText(text, true);
+        var size = text.length + ' 个字符（' + (text.split('\n').length - 1) + ' 个换行）';
+        banner(ok
+          ? '程序发来的 ' + size + '已写入剪贴板'
+          : '浏览器拒绝写入剪贴板：程序发来的 ' + size + '只留在了应用内（右键粘贴可用）',
+          ok ? 'receipt' : 'warn');
         return true;
       });
     } catch (e) { /* 老版本没有这个接口：当作不支持，右键复制仍然可用 */ }
@@ -2394,7 +2408,9 @@
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
     document.body.removeChild(ta);
     if (!ok && !quiet) banner('浏览器不允许写入剪贴板，请用 Ctrl+Insert 或系统复制', 'warn');
-    return true; // 有内容就算"复制"这个意图成立，调用方不必再退到粘贴
+    // 返回真实结果：调用方（OSC 52 的回执）要如实说写没写进去，
+    // 一律报 true 的话"程序复制了但剪贴板没变"这种情况就永远看不出来。
+    return ok;
   };
 
   // paste 把系统剪贴板的内容送进终端。
@@ -4124,6 +4140,41 @@
   var setOverlay = $('settings');
   var setTip = $('set-tip');
 
+  // 版本对账。
+  //
+  // "装了新版本、用起来没区别"这种问题，一半以上是服务端进程还是旧的，
+  // 剩下一半是页面跑着旧脚本。以前界面上没有任何版本号，用户只能猜，
+  // 我们这边也只能猜。所以两个都摆出来：
+  //   服务端 —— 现问一次 /api/healthz，回答"那个进程现在是哪个版本"；
+  //   页面脚本 —— BUILD，就是正在执行这行代码的这份 app.js 自带的。
+  // 两个不一致就是缓存没换，提示 Ctrl+F5；一致而问题还在，那就是真 bug。
+  Workspace.prototype.showVersion = function () {
+    var srvEl = $('set-ver-server');
+    var scrEl = $('set-ver-script');
+    var noteEl = $('set-ver-note');
+    if (!srvEl || !scrEl) return;
+
+    // 别拿字面量 '__V__' 来比：服务端是全文替换，这个判断里的占位符
+    // 也会被换成本次版本，于是永远成立、永远显示"未知"。看开头那个
+    // 下划线就够了 —— 真版本号一律是数字开头。
+    var script = (BUILD.charAt(0) === '_') ? '未知（未打包）' : BUILD;
+    scrEl.textContent = script;
+
+    fetch(API + 'healthz', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var v = j && j.ok === true && j.data ? j.data.version : '';
+        srvEl.textContent = v || '未知';
+        if (noteEl) {
+          // 只认"两个都有值且不相等"。取不到服务端版本时不下结论 ——
+          // 那多半是网络问题，报"版本不一致"只会把人带偏。
+          var stale = !!v && script !== '未知（未打包）' && v !== script;
+          noteEl.hidden = !stale;
+        }
+      })
+      .catch(function () { srvEl.textContent = '取不到（服务端不可达）'; });
+  };
+
   Workspace.prototype.isSettingsOpen = function () { return !setOverlay.hidden; };
 
   Workspace.prototype.fillSettingsForm = function () {
@@ -4146,6 +4197,7 @@
       p.session.term.textarea.blur();
     }
     this.fillSettingsForm();
+    this.showVersion();
     setTip.textContent = '';
     setTip.className = '';
     setOverlay.hidden = false;

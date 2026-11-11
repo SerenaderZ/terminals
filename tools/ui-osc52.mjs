@@ -157,6 +157,9 @@ process.on('exit', cleanup);
   await sleep(1800);
   const osc = await copied();
   check('OSC 52：文本进了剪贴板', osc === 'OSC-AAA\nOSC-中文', JSON.stringify(osc));
+  const receipt = await page.evaluate(() => document.getElementById('banner').textContent);
+  check('OSC 52 回执：字符数与换行数如实报出',
+    /14 个字符（1 个换行）已写入剪贴板/.test(receipt), JSON.stringify(receipt));
 
   // ---------- 3. 查询剪贴板不回 ----------
   const before = await page.evaluate(() => (window.__copied || []).length);
@@ -181,6 +184,28 @@ process.on('exit', cleanup);
   const nb = await page.evaluate(() => window.__copiedBeforeReplay);
   const na = await page.evaluate(() => (window.__copied || []).length);
   check('回放历史里的 OSC 52 不写剪贴板', na === nb, `${nb} → ${na}`);
+
+  // ---------- 5. 版本能自证：脚本自己带版本，设置页两个数字对得上 ----------
+  const hz = await page.evaluate(() =>
+    fetch('api/healthz', { cache: 'no-store' }).then((r) => r.json()));
+  const js = await page.evaluate(() =>
+    fetch('app.js', { cache: 'no-store' }).then((r) => r.text()));
+  const version = hz && hz.data && hz.data.version;
+  check('服务端报得出版本', !!version, JSON.stringify(hz));
+  check('app.js 里的 BUILD 已被替换成同一版本',
+    js.indexOf("var BUILD = '" + version + "'") >= 0 && js.indexOf("'__V__'") < 0,
+    `version=${version}`);
+  await page.evaluate(() => window.__ts.app.openSettings());
+  await sleep(500);
+  const shown = await page.evaluate(() => ({
+    server: document.getElementById('set-ver-server').textContent,
+    script: document.getElementById('set-ver-script').textContent,
+    noteHidden: document.getElementById('set-ver-note').hidden,
+  }));
+  check('设置页显示服务端 / 脚本版本，一致时不报"旧脚本"',
+    shown.server === version && shown.script === version && shown.noteHidden,
+    JSON.stringify(shown));
+  await page.evaluate(() => window.__ts.app.closeSettings());
 
   console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
   cleanup();
