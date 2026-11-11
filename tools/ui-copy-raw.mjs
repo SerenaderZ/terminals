@@ -156,13 +156,18 @@ process.on('exit', cleanup);
   }
 
   // ---------- 4. 选到末尾空行 ----------
+  //
+  // 框进去的空行算数：4 行就是 4 行，末尾那个换行必须留着。
+  // 0.4.6 时这里写的是"默认不留尾换行"，那是错的 —— 用户框了 5 行却只
+  // 粘出 3 行，正是从这条规则来的（见 0.5.2）。
   if (a >= 0 && b === a + 2) {
     await clearSel();
     await dragRows(a, b + 1);
     const t = await plain();
-    check('选到末尾空行：默认不留尾换行', !/\n$/.test(t), JSON.stringify(t.slice(-6)));
+    check('选到末尾空行：4 行就是 4 行', t.split('\n').length === 4, JSON.stringify(t));
+    check('选到末尾空行：尾换行留着', /\n$/.test(t), JSON.stringify(t.slice(-6)));
     const r = await raw();
-    check('选到末尾空行：原样通道留着尾换行', /\n$/.test(r) || /\u00a0$/.test(r),
+    check('选到末尾空行：原样通道同样 4 行', r.split('\n').length === 4,
       JSON.stringify(r.slice(-6)));
   }
 

@@ -181,6 +181,22 @@
 
   window.addEventListener('blur', function () { innerClip = null; });
 
+  // base64Text 把 OSC 52 的负载解成字符串。
+  //
+  // 程序一般按 UTF-8 编码后再 base64，所以先还原成字节再解码 —— 直接
+  // atob 出来的字符串按 UTF-16 处理，中文会全变成乱码。负载里也可能出现
+  // URL-safe 的 -_ 变体，顺手换回来。解不出来就返回空串，让调用方当作
+  // "这条序列没有内容"跳过。
+  function base64Text(b64) {
+    try {
+      var bin = window.atob(String(b64).replace(/-/g, '+').replace(/_/g, '/'));
+      var len = bin.length;
+      var bytes = new Uint8Array(len);
+      for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+      return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) { return ''; }
+  }
+
   // baseName 取路径最后一段，后台清单里用它当没有标题时的显示名。
   function baseName(p) {
     if (!p) return '终端';
@@ -768,6 +784,7 @@
     }
 
     this.installProtocolGuard();
+    this.installClipboardBridge(term);
 
     term.onData(function (data) {
       // 回放历史时不外发：那里面可能有程序当年发的 DA/DSR 查询，
@@ -1804,6 +1821,41 @@
     this.replayGuards = [];
   };
 
+  // installClipboardBridge 替程序把 OSC 52 的文本写进剪贴板。
+  //
+  // 这条序列是"选中即复制"的标准做法：程序把选中的文本 base64 一下，发
+  //   ESC ] 52 ; c ; <base64> BEL
+  // 由终端负责塞进系统剪贴板。Claude Code、tmux、Neovim 都靠它。
+  //
+  // 我们以前完全不认这条序列。Claude Code 拖选之后会在自己底下打一行
+  // "sent N chars via OSC 52" —— 那句话是真的，它确实发出去了，只是没人接。
+  // 于是剪贴板里还是上一次复制的内容：在里面选 5 行、粘出来却是早先那 3 行。
+  //
+  // 只做写、不做读：data 为 "?" 是查询剪贴板，一律不回。让程序读走系统
+  // 剪贴板是隐私事故，xterm 自己也不支持。
+  Session.prototype.installClipboardBridge = function (term) {
+    if (!term || !term.parser || !term.parser.registerOscHandler) return;
+    var self = this;
+    try {
+      term.parser.registerOscHandler(52, function (payload) {
+        // 回放历史时不照做。
+        //
+        // 日志里留着程序当年发的 OSC 52（Claude Code 每次复制都会写一条），
+        // 重放一遍就会把剪贴板刷成几年前的旧内容 —— 用户什么都没选，剪贴板
+        // 却被改掉了。真实终端重连时也不会替历史里的字节动剪贴板。
+        if (self.replaying) return true;
+        var i = payload.indexOf(';');
+        if (i < 0) return true;
+        var data = payload.slice(i + 1);
+        if (!data || data === '?') return true;   // 查询：不回
+        var text = base64Text(data);
+        if (!text) return true;
+        self.copyText(text, true);
+        return true;
+      });
+    } catch (e) { /* 老版本没有这个接口：当作不支持，右键复制仍然可用 */ }
+  };
+
   // finishCapture 收下最后一段回放字节，转去重铺。
   Session.prototype.finishCapture = function () {
     if (!this.captureReplay) return;
@@ -2218,16 +2270,18 @@
     }
     var text = out.join('\n');
     if (raw) return text;
-    // 末尾的换行去掉：粘贴时它只会多顶出一个空白行。
-    var trimmed = text.replace(/\s+$/, '');
-    if (trimmed) return trimmed;
-    // 整块选区都是空白（用户拉了一个空行下来）时不能裁成空串。
+    // 结尾的空行**不再裁**。
     //
-    // Windows 终端里把空行选中复制，粘出去就是一个换行；这里返回空串会被
-    // 上层当成"没选中" —— 右键落到粘贴上、拖完的设置里选区也当场被收掉，
-    // 等于"复制一个空行"这个动作根本不存在。所以按行数给换行：N 行给
-    // N-1 个（和带文字的选区同一套算法），只选一行也给一个，保证有结果。
-    return '\n'.repeat(Math.max(1, out.length - 1));
+    // 以前这里有个 replace(/\s+$/,'')，本意是抹掉最后一行那截终端填充。但
+    // 每行的填充在上面已经按行裁过了，这一下能裁到的只剩**用户真的框进去
+    // 的空行** —— 选 5 行（3 行字 + 2 行空）粘出来只剩 3 行，就是这么来的。
+    // Windows 终端里框住 5 行就是 5 行，空行也算，这里保持一致：N 行就是
+    // N 行、N-1 个换行，不多也不少。
+    //
+    // 唯一的特例：整块空白且只框了一行时 join 出来是空串，而空串会被上层
+    // 当成"没选中"（右键落到粘贴、松手就清选区）。给一个换行，和 Windows
+    // 终端"复制一个空行得到换行"一致。
+    return text === '' ? '\n' : text;
   };
 
   Session.prototype.paintSelection = function () {
@@ -2311,7 +2365,11 @@
   };
 
   // copyText 把一段文本写进系统剪贴板。
-  Session.prototype.copyText = function (text) {
+  //
+  // quiet 用于程序自己发起的复制（OSC 52）：写不进去不弹提示。Claude Code
+  // 那边本来就会打一句"paste fails 就按住 Shift 选"，再叠一条我们自己的
+  // 警告只是噪音；应用内剪贴板照样记下来，终端里右键粘贴仍然拿得到。
+  Session.prototype.copyText = function (text, quiet) {
     if (!text) return false;
 
     // 无论系统剪贴板写不写得进去，都在页面内留一份 —— http 下右键粘贴
@@ -2335,7 +2393,7 @@
     var ok = false;
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
     document.body.removeChild(ta);
-    if (!ok) banner('浏览器不允许写入剪贴板，请用 Ctrl+Insert 或系统复制', 'warn');
+    if (!ok && !quiet) banner('浏览器不允许写入剪贴板，请用 Ctrl+Insert 或系统复制', 'warn');
     return true; // 有内容就算"复制"这个意图成立，调用方不必再退到粘贴
   };
 
