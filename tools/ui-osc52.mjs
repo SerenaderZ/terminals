@@ -185,27 +185,38 @@ process.on('exit', cleanup);
   const na = await page.evaluate(() => (window.__copied || []).length);
   check('回放历史里的 OSC 52 不写剪贴板', na === nb, `${nb} → ${na}`);
 
-  // ---------- 5. 版本能自证：脚本自己带版本，设置页两个数字对得上 ----------
-  const hz = await page.evaluate(() =>
-    fetch('api/healthz', { cache: 'no-store' }).then((r) => r.json()));
-  const js = await page.evaluate(() =>
-    fetch('app.js', { cache: 'no-store' }).then((r) => r.text()));
-  const version = hz && hz.data && hz.data.version;
-  check('服务端报得出版本', !!version, JSON.stringify(hz));
-  check('app.js 里的 BUILD 已被替换成同一版本',
-    js.indexOf("var BUILD = '" + version + "'") >= 0 && js.indexOf("'__V__'") < 0,
-    `version=${version}`);
-  await page.evaluate(() => window.__ts.app.openSettings());
-  await sleep(500);
-  const shown = await page.evaluate(() => ({
-    server: document.getElementById('set-ver-server').textContent,
-    script: document.getElementById('set-ver-script').textContent,
-    noteHidden: document.getElementById('set-ver-note').hidden,
-  }));
-  check('设置页显示服务端 / 脚本版本，一致时不报"旧脚本"',
-    shown.server === version && shown.script === version && shown.noteHidden,
-    JSON.stringify(shown));
-  await page.evaluate(() => window.__ts.app.closeSettings());
+  // ---------- 5. 用户框的范围优先于程序随后发来的 OSC 52 ----------
+  // Claude Code 在 mouseup 之后才发序列，而且只带它渲染的那 3 行文字，
+  // 用户框进去的上下空行不在里面。这条序列不能把用户的高亮框盖掉。
+  await page.evaluate(() => window.__ts.app.newTab(true));
+  await sleep(1500);
+  await send(`node ${GEN_LINES}\r`);
+  await sleep(2200);
+  const r5 = await findRow('L1-COPY');
+  check('新标签里三行内容在屏幕上', r5 >= 0, `row=${r5}`);
+  if (r5 >= 0) {
+    await dragRows(r5, r5 + 4);
+    const picked = await plain();
+    check('用户框了 5 行', picked.split('\n').length === 5, JSON.stringify(picked));
+    const short = 'L1-COPY\nL2-COPY\nL3-COPY';   // 程序只交出 3 行
+    await page.evaluate((p) => {
+      window.__ts.app.activePane().session.term.write('\x1b]52;c;' + p + '\x07');
+    }, Buffer.from(short, 'utf8').toString('base64'));
+    await sleep(400);
+    const final = await copied();
+    check('程序只发 3 行时，剪贴板仍是用户框的 5 行',
+      final === picked, JSON.stringify(final));
+    const rec5 = await page.evaluate(() => document.getElementById('banner').textContent);
+    check('回执写明"按你框选的"', /按你框选的/.test(rec5), JSON.stringify(rec5));
+  }
+
+  // ---------- 6. 用户复制完之后，程序发起的复制照常生效 ----------
+  // 右键复制会结束这次交互，不能拿旧框去盖掉后面的程序复制。
+  await page.evaluate(() => window.__ts.app.activePane().session.clearSelection());
+  await send(`node ${GEN_OSC}\r`);
+  await sleep(1600);
+  const osc6 = await copied();
+  check('选区结束后 OSC 52 不被旧框覆盖', osc6 === 'OSC-AAA\nOSC-中文', JSON.stringify(osc6));
 
   console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
   cleanup();

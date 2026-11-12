@@ -18,12 +18,6 @@
   var API = BASE + 'api/';
   var WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + API + 'ws';
 
-  // 脚本自己的版本号，由服务端出站时把下面那个占位符换成本次运行的版本
-  // （见 internal/server 的 staticUI）。为什么非要埋在脚本里：光有服务端
-  // 版本回答不了"浏览器执行的到底是哪一份 app.js" —— 升级之后最常见的情况
-  // 就是服务端换了、页面还是旧的，用户在界面上一个能对照的数字都没有。
-  var BUILD = '__V__';
-
   var ACTIVE_KEY = 'terminals.active.v1';
   // 和服务端 internal/config 里的边界保持一致，否则会出现
   // "本地能调到 8，保存时被服务端打回"的割裂感。
@@ -1856,14 +1850,31 @@
         if (!data || data === '?') return true;   // 查询：不回
         var text = base64Text(data);
         if (!text) return true;
+
+        // 用户自己框出来的范围优先于程序单方面发来的复制。
+        //
+        // 0.5.2 把 OSC 52 接通之后，"框 5 行粘出来 3 行"反而变稳定了：
+        // Claude Code 在 mouseup 后发的那条序列只带它画出来的 3 行文字，
+        // 而且总是比我们晚到，于是用户框进去的空行被它覆盖掉。屏幕上那
+        // 个拖得动、看得见的高亮框才是人真正要复制的范围，这里把它换回来。
+        //
+        // 只在"刚拖完、且用户框的行数更多"时接管：没有框选或者框选早已
+        // 过期的场合（vim / tmux / ssh 里的 osc52 插件主动复制）照常生效；
+        // 程序给的比用户框的还完整时也不去动它。
+        var picked = self.lastPicked;
+        var fromUser = !!(picked && (Date.now() - picked.at) < 3000 &&
+          picked.text !== text &&
+          picked.text.split('\n').length > text.split('\n').length);
+        if (fromUser) text = picked.text;
+
         // 回执：程序那边只会说"我发出去了"，剪贴板里到底有没有、有多少，
-        // 只有终端自己知道。打出来的人能拿它和程序那句 "sent N chars" 对账，
-        // 数字一致就说明这条链路是通的；什么都没出现，就是这份脚本没跑到。
+        // 只有终端自己知道。数字能拿去和程序那句 "sent N chars" 对账；
+        // 换了用户框的内容时也要说清楚，免得两边数字对不上又是一头雾水。
         var ok = self.copyText(text, true);
         var size = text.length + ' 个字符（' + (text.split('\n').length - 1) + ' 个换行）';
         banner(ok
-          ? '程序发来的 ' + size + '已写入剪贴板'
-          : '浏览器拒绝写入剪贴板：程序发来的 ' + size + '只留在了应用内（右键粘贴可用）',
+          ? (fromUser ? '按你框选的 ' : '程序发来的 ') + size + '已写入剪贴板'
+          : '浏览器拒绝写入剪贴板：' + size + '只留在了应用内（右键粘贴可用）',
           ok ? 'receipt' : 'warn');
         return true;
       });
@@ -2246,6 +2257,15 @@
     var text = this.rangeText();
     if (!text) { this.clearSelection(); return; }
     this.selSnap = { text: text };
+    // 单独再留一份"用户刚刚框了什么"。
+    //
+    // 全屏程序开着鼠标追踪时，我们照样记范围但不拦事件：Claude Code 收到
+    // 鼠标报告会自己画框、自己发一条 OSC 52，里面的内容只含它渲染出来的
+    // 文字行（欢迎块就是那 3 行），用户框进去的上下空行根本不在里面。
+    // 那条序列在 mouseup 之后才到，会把剪贴板刷成 3 行 —— 人框了 5 行、
+    // 粘出来 3 行，就是这么来的。紧接着的整屏重绘还可能把 selRange /
+    // selSnap 一起清掉，所以这份快照要独立于选区存活，只按时间过期。
+    this.lastPicked = { text: text, at: Date.now() };
     this.paintSelection();
   };
 
@@ -2362,6 +2382,9 @@
     this.selSnap = null;
     this.selRange = null;
     this.selDrag = null;
+    // 用户已经把框选的内容拿走（右键复制）或主动丢开（点空白、按了键），
+    // 这次交互就结束了。之后程序再发 OSC 52 要照常生效，别再拿旧框去盖。
+    this.lastPicked = null;
     // xterm 自己那份选区也清掉：虽然不用它，但留着会让浏览器原生复制
     // （Ctrl+C 在非终端焦点时）拿到不一致的内容。
     try { if (this.term) this.term.clearSelection(); } catch (e) { }
@@ -4154,41 +4177,6 @@
   var setOverlay = $('settings');
   var setTip = $('set-tip');
 
-  // 版本对账。
-  //
-  // "装了新版本、用起来没区别"这种问题，一半以上是服务端进程还是旧的，
-  // 剩下一半是页面跑着旧脚本。以前界面上没有任何版本号，用户只能猜，
-  // 我们这边也只能猜。所以两个都摆出来：
-  //   服务端 —— 现问一次 /api/healthz，回答"那个进程现在是哪个版本"；
-  //   页面脚本 —— BUILD，就是正在执行这行代码的这份 app.js 自带的。
-  // 两个不一致就是缓存没换，提示 Ctrl+F5；一致而问题还在，那就是真 bug。
-  Workspace.prototype.showVersion = function () {
-    var srvEl = $('set-ver-server');
-    var scrEl = $('set-ver-script');
-    var noteEl = $('set-ver-note');
-    if (!srvEl || !scrEl) return;
-
-    // 别拿字面量 '__V__' 来比：服务端是全文替换，这个判断里的占位符
-    // 也会被换成本次版本，于是永远成立、永远显示"未知"。看开头那个
-    // 下划线就够了 —— 真版本号一律是数字开头。
-    var script = (BUILD.charAt(0) === '_') ? '未知（未打包）' : BUILD;
-    scrEl.textContent = script;
-
-    fetch(API + 'healthz', { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        var v = j && j.ok === true && j.data ? j.data.version : '';
-        srvEl.textContent = v || '未知';
-        if (noteEl) {
-          // 只认"两个都有值且不相等"。取不到服务端版本时不下结论 ——
-          // 那多半是网络问题，报"版本不一致"只会把人带偏。
-          var stale = !!v && script !== '未知（未打包）' && v !== script;
-          noteEl.hidden = !stale;
-        }
-      })
-      .catch(function () { srvEl.textContent = '取不到（服务端不可达）'; });
-  };
-
   Workspace.prototype.isSettingsOpen = function () { return !setOverlay.hidden; };
 
   Workspace.prototype.fillSettingsForm = function () {
@@ -4211,7 +4199,6 @@
       p.session.term.textarea.blur();
     }
     this.fillSettingsForm();
-    this.showVersion();
     setTip.textContent = '';
     setTip.className = '';
     setOverlay.hidden = false;

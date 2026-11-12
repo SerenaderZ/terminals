@@ -1112,40 +1112,6 @@ input.switch:focus-visible { outline: 2px solid var(--accent-soft); outline-offs
 
 #set-tip.warn { color: var(--warn); }
 
-/* 版本对账那一行：位置固定在面板底部，字号比正文再小一档 ——
-   它是排障信息，不该跟设置项抢注意力。上下用分隔线隔开，
-   念作"这两个数字属于另一件事"。 */
-#set-ver {
-  margin-top: 18px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-  color: var(--fg-dim);
-  font-size: 11px;
-  line-height: 1.7;
-}
-
-#set-ver b {
-  color: var(--fg);
-  font-weight: 600;
-  /* 版本号是给人逐位比对的，等宽数字才不会看串位 */
-  font-variant-numeric: tabular-nums;
-  font-family: var(--font-mono);
-}
-
-#set-ver .set-ver-sep {
-  margin: 0 6px;
-  opacity: 0.6;
-}
-
-#set-ver-note {
-  margin-top: 8px;
-  padding: 7px 10px;
-  border-left: 2px solid var(--warn);
-  background: var(--bg-chrome);
-  color: var(--fg);
-  line-height: 1.6;
-}
-
 /* -------------------------------------------------------------- 确认框 */
 
 /* 破坏性动作（结束全部）要二次确认。不用浏览器原生 confirm：

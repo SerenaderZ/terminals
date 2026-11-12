@@ -100,17 +100,6 @@ func (s *Server) staticUI() http.Handler {
 		index = bytes.ReplaceAll(index, []byte("__V__"), []byte(ver))
 	}
 
-	// app.js 自己也埋了一份版本号（前端顶部那个 BUILD）。
-	//
-	// 只给 index.html 打桩是不够的：设置页要回答"浏览器执行的到底是哪一份
-	// 脚本"，而答案只能来自脚本自己。这里顺手替换掉那个占位符，代价是
-	// 一份几 KB 的替换，换来的是升级之后"服务端 0.5.2 / 页面脚本 0.5.1"
-	// 这种状态能一眼看出来，而不是靠猜。
-	appJS, appErr := ui.FS.ReadFile("app.js")
-	if appErr == nil && bytes.Contains(appJS, []byte("__V__")) {
-		appJS = bytes.ReplaceAll(appJS, []byte("__V__"), []byte(session.Version))
-	}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// no-cache：可以存，但每次都要回源确认。局域网里多跑一次请求，
 		// 换来的是"升级即生效"，值。
@@ -124,12 +113,6 @@ func (s *Server) staticUI() http.Handler {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Content-Length", strconv.Itoa(len(index)))
 			_, _ = w.Write(index)
-			return
-		}
-		if r.URL.Path == "/app.js" && appErr == nil {
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Header().Set("Content-Length", strconv.Itoa(len(appJS)))
-			_, _ = w.Write(appJS)
 			return
 		}
 		files.ServeHTTP(w, r)
