@@ -159,7 +159,7 @@ process.on('exit', cleanup);
   check('OSC 52：文本进了剪贴板', osc === 'OSC-AAA\nOSC-中文', JSON.stringify(osc));
   const receipt = await page.evaluate(() => document.getElementById('banner').textContent);
   check('OSC 52 回执：字符数与换行数如实报出',
-    /14 个字符（1 个换行）已写入剪贴板/.test(receipt), JSON.stringify(receipt));
+    /程序发来的 2 行（14 个字符）已写入剪贴板/.test(receipt), JSON.stringify(receipt));
 
   // ---------- 3. 查询剪贴板不回 ----------
   const before = await page.evaluate(() => (window.__copied || []).length);

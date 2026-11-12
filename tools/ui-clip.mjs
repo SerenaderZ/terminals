@@ -203,7 +203,7 @@ const ctxPaste = await page.evaluate(() => window.__ctx);
 const pasteTip = await bannerText();
 check('无选区右键 = 粘贴（不再弹原生菜单）', ctxPaste && ctxPaste.prevented === true,
   ctxPaste ? `prevented=${ctxPaste.prevented}` : '没捕到事件');
-check('提示说明粘的是终端内复制的内容', /已粘贴终端内复制的/.test(pasteTip), pasteTip);
+check('提示报出这次送进终端几行', /已粘贴 \d+ 行（\d+ 个字符）/.test(pasteTip), pasteTip);
 
 const pastedLine = await page.evaluate(() => {
   const st = window.__ts.app.activePane().session;

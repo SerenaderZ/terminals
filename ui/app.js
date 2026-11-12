@@ -953,9 +953,10 @@
         e.preventDefault();
         self.copyText(text);
         self.clearSelection();
-        if (text.trim()) banner('已复制 ' + text.length + ' 个字符', 'ok');
+        var lines = text.split('\n').length;
+        if (text.trim()) banner('已复制 ' + lines + ' 行（' + text.length + ' 个字符）', 'ok');
         // 纯空白选区：复制到的是换行，"字符"听起来像哪里出错了
-        else banner('已复制 ' + (text.split('\n').length - 1) + ' 个空行', 'ok');
+        else banner('已复制 ' + (lines - 1) + ' 个空行', 'ok');
         return;
       }
 
@@ -1871,7 +1872,7 @@
         // 只有终端自己知道。数字能拿去和程序那句 "sent N chars" 对账；
         // 换了用户框的内容时也要说清楚，免得两边数字对不上又是一头雾水。
         var ok = self.copyText(text, true);
-        var size = text.length + ' 个字符（' + (text.split('\n').length - 1) + ' 个换行）';
+        var size = text.split('\n').length + ' 行（' + text.length + ' 个字符）';
         banner(ok
           ? (fromUser ? '按你框选的 ' : '程序发来的 ') + size + '已写入剪贴板'
           : '浏览器拒绝写入剪贴板：' + size + '只留在了应用内（右键粘贴可用）',
@@ -2479,25 +2480,27 @@
 
   // pasteInner 粘应用内剪贴板（本页最近一次复制的文字），返回是否粘上了。
   // http 下的"右键一步粘贴"靠它；HTTPS 下作为权限被拒时的兜底。
+  //
+  // 回执报的是"这一次往终端里送了几行"，不是"屏幕上能看见几行"。
+  // 全屏程序（Claude Code 的输入框）收到多行文本之后会自己决定怎么显示：
+  // 消息末尾的空行几乎都会被它去掉，于是 5 行看起来只有 3 行。把发出去的
+  // 行数报出来，才能分清是终端少送了还是程序少显示了。
   Session.prototype.pasteInner = function () {
     var text = readInnerClip();
     if (!text || !this.term) return false;
     this.term.paste(text);
     this.focus();
-    banner('已粘贴终端内复制的 ' + text.length + ' 个字符 · 外部内容请按 Ctrl+V', 'info');
+    banner('已粘贴 ' + text.split('\n').length + ' 行（' + text.length + ' 个字符）', 'info');
     return true;
   };
 
   // awaitPaste 是最后的兜底：把焦点摆好，把还能用的入口说准。
-  // 浏览器只把剪贴板数据交给真实按键，所以这里能做的只有提示。
   //
-  // 只说 Ctrl+V，不提"右键菜单"：右键分支在安全上下文里正是刚才失败的那条
-  // 路，它同样被 preventDefault 掉，让用户再点一次右键只会再看到同一句话。
+  // 只说右键菜单，不说快捷键：这套复制粘贴从头到尾都是鼠标完成的。
+  // 右键菜单里的"粘贴"由浏览器自己执行，非安全上下文照样能用。
   Session.prototype.awaitPaste = function () {
     this.focus();
-    banner(window.isSecureContext
-      ? '浏览器不允许读取剪贴板，请按 Ctrl+V 粘贴'
-      : '这个 http 页面读不到剪贴板，请按 Ctrl+V 粘贴', 'ask');
+    banner('这个页面读不到剪贴板：右键点一下，选菜单里的「粘贴」', 'ask');
   };
 
   Session.prototype.dispose = function () {
