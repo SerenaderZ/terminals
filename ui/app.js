@@ -32,7 +32,13 @@
     fontSize: 14,
     webgl: true,
     cursorBlink: true,
-    scrollback: 10000
+    scrollback: 10000,
+    // 文件侧栏：默认关着（首次安装不该凭空多一块东西）。filesConn 记上次
+    // 用的来源，"local" 或某条远程连接的 id。
+    filesOpen: false,
+    filesConn: 'local',
+    filesWidth: 300,
+    filesTreeH: 40
   };
 
   function cachedSettings() {
@@ -4177,6 +4183,9 @@
         store(SETTINGS_KEY, JSON.stringify(self.settings));
         self.applySettings();
         self.fillSettingsForm();
+        // 侧栏的开关、宽度、上次用的来源都在设置里：服务端回来的这份
+        // 才是准的（localStorage 只是首屏缓存）。
+        if (self.files) self.files.applySettings();
       })
       .catch(function () { /* 离线就用缓存，不打扰用户 */ });
   };
@@ -4500,6 +4509,9 @@
         if (!this.isHistoryOpen()) this.closeBackgroundPanel();
         this.toggleHistoryPanel();
         break;
+      case 'f': case 'F':
+        if (this.files) this.files.setOpen(!this.files.open);
+        break;
       case 'q': case 'Q': this.askCloseAll(); break;
       case ',': case '<': this.toggleSettings(); break;
       case '[': this.cycleTab(-1); break;
@@ -4519,9 +4531,1250 @@
     }
   };
 
+  // ------------------------------------------------------------ 文件侧栏
+  //
+  // 左栏的文件浏览器，形状照 MobaXterm 的 SFTP 面板：上面是目录树，下面是
+  // 当前目录的文件列表，中间可以拖。三条取舍写在这里，免得以后改乱：
+  //
+  //  1. 默认是关的。首次安装打开页面不该凭空多出一块东西；用户点了标题栏
+  //     那个文件夹按钮之后，这个状态存进服务端设置，下次打开还是开着——
+  //     换浏览器、换设备都一样，和布局、主题的做法一致。
+  //  2. 单击选中、双击进入，和系统文件管理器一致。侧栏很窄，不做"单击即
+  //     打开"：误点一次就跳进陌生目录太烦。
+  //  3. 上传不排队、不弹窗，拖进去就开始传，传完刷新列表。中间态越少越好。
+
+  var ICO_DIR =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"' +
+    ' stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4.2l1.8 2h8A1.5 1.5 0 0 1 20 9.5v7' +
+    'A1.5 1.5 0 0 1 18.5 18h-14A1.5 1.5 0 0 1 3 16.5z"/></svg>';
+
+  var ICO_FILE =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"' +
+    ' stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M6.5 3.5h7L18 8v12a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 5 20V5' +
+    'a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M13.5 3.5V8H18"/></svg>';
+
+  var ICO_LINK =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"' +
+    ' stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M10.5 13.5a3.5 3.5 0 0 0 5 0l2.5-2.5a3.5 3.5 0 0 0-5-5L11.5 7.5"/>' +
+    '<path d="M13.5 10.5a3.5 3.5 0 0 0-5 0L6 13a3.5 3.5 0 0 0 5 5l1.5-1.5"/></svg>';
+
+  function encPath(s) { return encodeURIComponent(s == null ? '' : String(s)); }
+
+  // fmtSize 只用于侧栏那一列窄字。1024 进制，一位小数够看；
+  // 超过 10 就不要小数了，那一列放不下。
+  function fmtSize(n) {
+    if (n === undefined || n === null) return '';
+    if (n <= 0) return '';
+    var units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    var i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? String(v) : v.toFixed(v < 10 ? 1 : 0)) + ' ' + units[i];
+  }
+
+  function fmtTime(sec) {
+    if (!sec) return '';
+    var d = new Date(sec * 1000);
+    var now = new Date();
+    var p = function (x) { return x < 10 ? '0' + x : '' + x; };
+    var sameDay = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    if (sameDay) return p(d.getHours()) + ':' + p(d.getMinutes());
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' '
+      + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  // pathParts 把一条绝对路径拆成"从根到它自己"的每一级。
+  //
+  // 目录树要靠它建出祖先链：从 / 一路展开到 home，而不是只给一个孤零零的
+  // 起始节点。Windows 的盘符（C:\）单独算一级，不然会变成 c: 这种残缺节点。
+  function pathParts(p) {
+    if (!p) return [];
+    var win = /^[A-Za-z]:/.test(p);
+    var root = win ? p.slice(0, 2) + '\\' : '/';
+    var rest = p.slice(root.length).split(/[\\\/]+/);
+    var out = [{ name: win ? root : '/', path: root }];
+    var cur = root;
+    for (var i = 0; i < rest.length; i++) {
+      var seg = rest[i];
+      if (!seg) continue;
+      cur = win ? cur.replace(/\\$/, '') + '\\' + seg : cur.replace(/\/$/, '') + '/' + seg;
+      out.push({ name: seg, path: cur });
+    }
+    return out;
+  }
+
+  function joinPath(dir, name) {
+    if (!dir) return name;
+    return dir.replace(/[\\\/]+$/, '') + '/' + name;
+  }
+
+  function FilesPanel(app) {
+    this.app = app;
+    this.conn = 'local';
+    this.conns = [];
+    this.path = '';
+    this.parent = '';
+    this.home = '';
+    this.items = [];
+    this.selIndex = -1;
+    this.open = false;
+    this.booted = false;
+    this.width = 300;
+    this.treeH = 40;
+    this.seq = 0;
+    this.lastSid = '';
+    this.lastCwd = '';
+    this.cwdTimer = null;
+    this.el = {};
+    this._fitTimer = null;
+    this._dragDepth = 0;
+    this.connEditing = null;
+  }
+
+  FilesPanel.prototype.init = function () {
+    var self = this;
+    ['files', 'files-conn', 'files-manage', 'files-grip', 'files-close', 'files-up',
+      'files-path', 'files-refresh', 'files-progress', 'files-body', 'files-tree',
+      'files-split', 'files-list', 'files-drop', 'files-info', 'files-upload',
+      'files-mkdir', 'files-menu', 'conns', 'cs-list', 'cs-name', 'cs-host',
+      'cs-port', 'cs-user', 'cs-auth', 'cs-pw-row', 'cs-password', 'cs-key-row',
+      'cs-keypath', 'cs-pass-row', 'cs-passphrase', 'cs-tip', 'cs-new', 'cs-test',
+      'cs-save', 'cs-close'].forEach(function (id) { self.el[id] = $(id); });
+
+    // 几个用得太频繁的，给一个短名。混着写 this.el.info 和
+    // this.el['files-info'] 迟早会漏掉一个 —— 之前就是漏了，导致整个列表
+    // 渲染到一半抛异常，看起来像"面板打开了但什么都不显示"。
+    this.el.info = this.el['files-info'];
+    this.el.path = this.el['files-path'];
+    this.el.up = this.el['files-up'];
+
+    this.buildUploadInput();
+    this.bind();
+    this.applySettings();
+  };
+
+  FilesPanel.prototype.buildUploadInput = function () {
+    var self = this;
+    var inp = document.createElement('input');
+    inp.type = 'file';
+    inp.multiple = true;
+    inp.style.display = 'none';
+    inp.addEventListener('change', function () {
+      var files = Array.prototype.slice.call(inp.files || []);
+      inp.value = '';
+      if (files.length) self.upload(files, self.path);
+    });
+    document.body.appendChild(inp);
+    this.uploadInput = inp;
+  };
+
+  FilesPanel.prototype.bind = function () {
+    var self = this;
+    var e = this.el;
+
+    var btn = $('btn-files');
+    if (btn) {
+      btn.addEventListener('click', function () { self.setOpen(!self.open); });
+    }
+
+    e['files-close'].addEventListener('click', function () { self.setOpen(false); });
+    e['files-manage'].addEventListener('click', function () { self.openConns(); });
+
+    e['files-conn'].addEventListener('change', function () {
+      self.useConn(this.value);
+    });
+
+    e['files-up'].addEventListener('click', function () {
+      if (self.parent) self.go(self.parent);
+    });
+    e['files-refresh'].addEventListener('click', function () {
+      if (self.path) self.go(self.path, { force: true });
+    });
+
+    e['files-path'].addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        ev.target.blur();
+        var p = this.value.trim();
+        if (p) self.go(p, { force: true });
+      } else if (ev.key === 'Escape') {
+        ev.preventDefault();
+        this.value = self.path;
+        this.blur();
+      }
+    });
+    // 没按回车就点走了：把输入框恢复成当前路径，别留一个看起来生效了的
+    // 半截路径在那里骗人。
+    e['files-path'].addEventListener('blur', function () {
+      this.value = self.path;
+    });
+
+    e['files-upload'].addEventListener('click', function () {
+      self.uploadInput.click();
+    });
+    e['files-mkdir'].addEventListener('click', function () { self.mkdir(); });
+
+    // ---------------------------------------------------------- 列表交互
+
+    e['files-list'].addEventListener('click', function (ev) {
+      var row = ev.target.closest ? ev.target.closest('.frow') : null;
+      if (!row || !row.dataset.index) { self.select(-1); return; }
+      self.select(parseInt(row.dataset.index, 10));
+    });
+
+    e['files-list'].addEventListener('dblclick', function (ev) {
+      var row = ev.target.closest ? ev.target.closest('.frow') : null;
+      if (!row || !row.dataset.index) return;
+      var it = self.items[parseInt(row.dataset.index, 10)];
+      if (it) self.openItem(it);
+    });
+
+    e['files-list'].addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      var row = ev.target.closest ? ev.target.closest('.frow') : null;
+      if (row && row.dataset.index) {
+        var i = parseInt(row.dataset.index, 10);
+        self.select(i);
+        self.showMenu(ev.clientX, ev.clientY, self.items[i]);
+      } else {
+        self.select(-1);
+        self.showMenu(ev.clientX, ev.clientY, null);
+      }
+    });
+
+    // 空白处右键也要能"新建/上传"，这是文件管理器的常规操作。
+    e['files-list'].addEventListener('keydown', function (ev) {
+      if (self.el['files-menu'].hidden === false) return;
+      if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        var n = self.items.length;
+        if (!n) return;
+        var i = self.selIndex + (ev.key === 'ArrowDown' ? 1 : -1);
+        self.select(Math.max(0, Math.min(n - 1, i)), true);
+      } else if (ev.key === 'Enter') {
+        ev.preventDefault();
+        if (self.items[self.selIndex]) self.openItem(self.items[self.selIndex]);
+      } else if (ev.key === 'Backspace') {
+        ev.preventDefault();
+        if (self.parent) self.go(self.parent);
+      }
+    });
+
+    // ---------------------------------------------------------- 目录树
+
+    e['files-tree'].addEventListener('click', function (ev) {
+      var row = ev.target.closest ? ev.target.closest('.tnode') : null;
+      if (!row) return;
+      var node = row.__node;
+      if (!node) return;
+      if (ev.target.classList.contains('ttwist')) {
+        self.toggleNode(node);
+        return;
+      }
+      self.toggleNode(node, true);
+      self.go(row.dataset.path);
+    });
+
+    // ---------------------------------------------------------- 拖放上传
+
+    var panel = e['files'];
+    var hasFiles = function (ev) {
+      var dt = ev.dataTransfer;
+      if (!dt) return false;
+      var t = dt.types;
+      if (!t) return false;
+      for (var i = 0; i < t.length; i++) if (t[i] === 'Files') return true;
+      return false;
+    };
+
+    panel.addEventListener('dragenter', function (ev) {
+      if (!hasFiles(ev)) return;
+      ev.preventDefault();
+      self._dragDepth++;
+      e['files-drop'].hidden = false;
+    });
+    panel.addEventListener('dragover', function (ev) {
+      if (!hasFiles(ev)) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'copy';
+    });
+    panel.addEventListener('dragleave', function (ev) {
+      if (!hasFiles(ev)) return;
+      self._dragDepth--;
+      if (self._dragDepth <= 0) {
+        self._dragDepth = 0;
+        e['files-drop'].hidden = true;
+      }
+    });
+    panel.addEventListener('drop', function (ev) {
+      if (!hasFiles(ev)) return;
+      ev.preventDefault();
+      self._dragDepth = 0;
+      e['files-drop'].hidden = true;
+      var files = Array.prototype.slice.call(ev.dataTransfer.files || []);
+      if (files.length) self.upload(files, self.path || self.home);
+    });
+
+    // ---------------------------------------------------------- 调整尺寸
+
+    e['files-grip'].addEventListener('mousedown', function (ev) {
+      ev.preventDefault();
+      var startX = ev.clientX;
+      var startW = e['files'].getBoundingClientRect().width;
+
+      var move = function (mv) {
+        var w = startW + (mv.clientX - startX);
+        self.setWidth(w, false);
+      };
+      var up = function () {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        document.body.style.cursor = '';
+        self.app.saveSettings({ filesWidth: Math.round(self.width) });
+      };
+      document.body.style.cursor = 'col-resize';
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+
+    e['files-split'].addEventListener('mousedown', function (ev) {
+      ev.preventDefault();
+      var body = e['files-body'].getBoundingClientRect();
+      var move = function (mv) {
+        var h = ((mv.clientY - body.top) / body.height) * 100;
+        h = Math.max(15, Math.min(85, h));
+        self.treeH = h;
+        e['files-tree'].style.height = h + '%';
+      };
+      var up = function () {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        e['files-split'].classList.remove('dragging');
+        document.body.style.cursor = '';
+        self.app.saveSettings({ filesTreeH: Math.round(self.treeH) });
+      };
+      e['files-split'].classList.add('dragging');
+      document.body.style.cursor = 'row-resize';
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
+
+    // 右键菜单点外面就收。用 capture 阶段，保证在别的按钮响应之前关掉。
+    document.addEventListener('mousedown', function (ev) {
+      var m = e['files-menu'];
+      if (m.hidden) return;
+      if (m.contains(ev.target)) return;
+      m.hidden = true;
+    }, true);
+
+    window.addEventListener('blur', function () { e['files-menu'].hidden = true; });
+
+    // ---------------------------------------------------------- 连接管理
+
+    e['cs-close'].addEventListener('click', function () { self.closeConns(); });
+    e['cs-new'].addEventListener('click', function () {
+      self.clearConnForm();
+      self.renderConnList();
+      self.el['cs-host'].focus();
+    });
+    e['cs-save'].addEventListener('click', function () { self.saveConn(); });
+    e['cs-test'].addEventListener('click', function () { self.testConn(); });
+    e['cs-auth'].addEventListener('change', function () { self.syncAuthRows(); });
+
+    e.conns.addEventListener('mousedown', function (ev) {
+      if (ev.target === e.conns) self.closeConns();
+    });
+
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Escape') return;
+      if (e.conns.hidden) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      self.closeConns();
+    }, true);
+  };
+
+  // ------------------------------------------------------------ 开关与尺寸
+
+  FilesPanel.prototype.applySettings = function () {
+    var s = this.app.settings || {};
+    this.width = s.filesWidth || 300;
+    this.treeH = s.filesTreeH || 40;
+    this.el['files'].style.width = this.width + 'px';
+    this.el['files-tree'].style.height = this.treeH + '%';
+
+    var want = s.filesConn || 'local';
+    if (want !== this.conn) {
+      this.conn = want;
+      if (this.booted) this.useConn(want, { silent: true });
+    }
+    this.el['files-conn'].value = this.conn;
+    this.setOpen(!!s.filesOpen, false);
+  };
+
+  FilesPanel.prototype.setOpen = function (on, persist) {
+    on = !!on;
+    var changed = this.open !== on;
+    this.open = on;
+    this.el['files'].hidden = !on;
+
+    var btn = $('btn-files');
+    if (btn) btn.classList.toggle('active', on);
+
+    if (on) this.boot();
+    if (changed) this.fitTerminals();
+    if (persist !== false && changed) this.app.saveSettings({ filesOpen: on });
+  };
+
+  FilesPanel.prototype.setWidth = function (w, doFit) {
+    var max = Math.min(1200, window.innerWidth * 0.7);
+    w = Math.max(200, Math.min(max, w));
+    this.width = w;
+    this.el['files'].style.width = w + 'px';
+    if (doFit !== false) this.fitTerminals();
+  };
+
+  // fitTerminals 让所有窗格重新量尺寸。
+  //
+  // 侧栏一开一关，终端可用宽度就变了：不重新 fit，xterm 还按老列数画，
+  // 右侧会空出一条、或者最后一列被切掉。拖拽时连续触发，所以交给
+  // scheduleFit 的 80ms 防抖，不会把 PTY 刷爆。
+  FilesPanel.prototype.fitTerminals = function () {
+    var self = this;
+    clearTimeout(this._fitTimer);
+    this._fitTimer = setTimeout(function () {
+      self.app.eachSession(function (st) { st.scheduleFit(); });
+    }, 30);
+  };
+
+  // ------------------------------------------------------------ 来源与连接
+
+  FilesPanel.prototype.boot = function () {
+    var self = this;
+    if (this.booted) {
+      if (this.path) this.go(this.path, { force: true });
+      return;
+    }
+    this.booted = true;
+
+    this.loadConns().then(function () {
+      var id = self.conn;
+      if (id !== 'local' && !self.findConn(id)) {
+        // 上次用的那条远程连接已经不在了（在别的设备上删掉了）。
+        id = 'local';
+        self.conn = id;
+        self.el['files-conn'].value = id;
+        self.app.saveSettings({ filesConn: id });
+      }
+      self.useConn(id, { silent: true });
+    });
+
+    this.startFollow();
+  };
+
+  FilesPanel.prototype.loadConns = function () {
+    var self = this;
+    return fetch(API + 'files/conns', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        self.conns = (j && j.ok && j.data) || [];
+        self.renderConnSelect();
+      })
+      .catch(function () {
+        self.conns = [];
+        self.renderConnSelect();
+      });
+  };
+
+  FilesPanel.prototype.findConn = function (id) {
+    for (var i = 0; i < this.conns.length; i++) {
+      if (this.conns[i].id === id) return this.conns[i];
+    }
+    return null;
+  };
+
+  FilesPanel.prototype.renderConnSelect = function () {
+    var sel = this.el['files-conn'];
+    sel.innerHTML = '';
+
+    var local = document.createElement('option');
+    local.value = 'local';
+    local.textContent = '本机';
+    sel.appendChild(local);
+
+    for (var i = 0; i < this.conns.length; i++) {
+      var c = this.conns[i];
+      var o = document.createElement('option');
+      o.value = c.id;
+      o.textContent = c.name || (c.user + '@' + c.host);
+      sel.appendChild(o);
+    }
+
+    var exists = this.conn === 'local' || !!this.findConn(this.conn);
+    sel.value = exists ? this.conn : 'local';
+  };
+
+  FilesPanel.prototype.useConn = function (id, opt) {
+    var self = this;
+    opt = opt || {};
+    this.conn = id || 'local';
+    if (!opt.silent) this.app.saveSettings({ filesConn: this.conn });
+
+    this.el['files-conn'].value = this.conn;
+    this.items = [];
+    this.selIndex = -1;
+    this.path = '';
+    this.parent = '';
+    this.lastCwd = '';
+    this.lastSid = '';
+    this.el['files-tree'].innerHTML = '';
+    this.el['files-list'].innerHTML = '<div class="files-hint">正在连接…</div>';
+    this.el.info.textContent = '—';
+    this.el.up.disabled = true;
+
+    fetch(API + 'files/home?conn=' + encPath(this.conn), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.ok) throw new Error((j && j.error) || '打不开这个来源');
+        var home = (j.data && j.data.home) || '/';
+        self.home = home;
+        self.buildTree(home);
+        self.go(home, { force: true });
+      })
+      .catch(function (err) {
+        self.el['files-list'].innerHTML = '';
+        var h = el('div', 'files-hint warn');
+        h.textContent = '打不开这个来源：\n' + (err.message || '未知错误');
+        self.el['files-list'].appendChild(h);
+        banner(err.message || '文件来源连接失败', 'warn');
+      });
+  };
+
+  // ------------------------------------------------------------ 列表与导航
+
+  FilesPanel.prototype.go = function (p, opt) {
+    var self = this;
+    opt = opt || {};
+    var seq = ++this.seq;
+
+    fetch(API + 'files/list?conn=' + encPath(this.conn) + '&path=' + encPath(p), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (seq !== self.seq) return;    // 连点了几个目录，只认最后一次
+        if (!j || !j.ok) {
+          banner((j && j.error) || '打不开这个目录', 'warn');
+          return;
+        }
+        var d = j.data || {};
+        self.path = d.path || p;
+        self.parent = d.parent || '';
+        self.items = d.items || [];
+        self.selIndex = -1;
+        self.el.path.value = self.path;
+        self.el.up.disabled = !self.parent;
+        self.render();
+        self.markTree(self.path);
+        self.el.info.textContent = self.items.length ? (self.items.length + ' 项') : '空目录';
+        if (d.truncated) banner('目录里的东西太多，只显示了一部分', 'info');
+      })
+      .catch(function () {
+        if (seq !== self.seq) return;
+        banner('读取目录失败（网络或连接问题）', 'warn');
+      });
+  };
+
+  FilesPanel.prototype.render = function () {
+    var self = this;
+    var list = this.el['files-list'];
+    list.innerHTML = '';
+
+    if (!this.items.length) {
+      var h = el('div', 'files-hint');
+      h.textContent = '这个目录是空的';
+      list.appendChild(h);
+      return;
+    }
+
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < this.items.length; i++) {
+      frag.appendChild(this.makeRow(this.items[i], i));
+    }
+    list.appendChild(frag);
+  };
+
+  FilesPanel.prototype.makeRow = function (it, i) {
+    var row = el('div', 'frow');
+    row.dataset.index = String(i);
+    if (it.dir) row.classList.add('is-dir');
+    if (it.link) row.classList.add('is-link');
+    if (!it.dir && it.name.charAt(0) === '.') row.classList.add('is-hidden');
+
+    var icon = it.link ? ICO_LINK : (it.dir ? ICO_DIR : ICO_FILE);
+    row.innerHTML = '<span class="fico">' + icon + '</span>' +
+      '<span class="fname"></span>' +
+      '<span class="fmeta"></span>';
+    row.querySelector('.fname').textContent = it.name;
+    row.querySelector('.fmeta').textContent = it.dir ? '' : fmtSize(it.size);
+
+    // 悬停看全名：文件名和大小挤在 300px 里，长名字一定被省略号吃掉，
+    // 靠 title 兜一层，不用为了看个全名去拖宽侧栏。
+    var tip = [it.name];
+    if (it.dir) tip.push('文件夹');
+    else if (it.size) tip.push(fmtSize(it.size));
+    if (it.mtime) tip.push(fmtTime(it.mtime));
+    row.title = tip.join(' · ');
+
+    if (it.err) {
+      var e = el('span', 'ferr');
+      e.textContent = '!';
+      row.appendChild(e);
+    }
+    return row;
+  };
+
+  FilesPanel.prototype.select = function (i, scroll) {
+    this.selIndex = i;
+    var rows = this.el['files-list'].querySelectorAll('.frow[data-index]');
+    for (var k = 0; k < rows.length; k++) {
+      rows[k].classList.toggle('sel', parseInt(rows[k].dataset.index, 10) === i);
+    }
+
+    var it = this.items[i];
+    if (!it) {
+      this.el.info.textContent = this.items.length ? (this.items.length + ' 项') : '空目录';
+      this.el.info.removeAttribute('title');
+      return;
+    }
+
+    // 状态行只放"一眼要看的": 大小、改的时间。
+    //
+    // 名称列表里已经高亮了，权限位对普通用户没意义（而且 Windows 上
+    // 目录也会报成 -rwxrwxrwx），塞进来只会把 300px 撑爆、逼出省略号。
+    // 想较真的信息走悬停提示，完整路径加权限都在那儿。
+    var kind = it.dir ? '文件夹' : (fmtSize(it.size) || '空文件');
+    var bits = [kind];
+    if (it.mtime) bits.push(fmtTime(it.mtime));
+    if (it.err) bits.push(it.err);
+    this.el.info.textContent = bits.join(' · ');
+
+    var tip = [it.path];
+    tip.push(it.dir ? '文件夹' : ('文件 · ' + (fmtSize(it.size) || '0 B')));
+    if (it.mtime) tip.push('修改于 ' + fmtTime(it.mtime));
+    if (it.mode) tip.push('权限 ' + it.mode);
+    if (it.err) tip.push(it.err);
+    this.el.info.title = tip.join('\n');
+
+    if (scroll) {
+      var row = this.el['files-list'].querySelector('.frow[data-index="' + i + '"]');
+      if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+    }
+  };
+
+  FilesPanel.prototype.openItem = function (it) {
+    if (!it) return;
+    if (it.dir) this.go(it.path);
+    else this.download(it);
+  };
+
+  // ------------------------------------------------------------ 目录树
+
+  FilesPanel.prototype.buildTree = function (home) {
+    var self = this;
+    var parts = pathParts(home);
+    var tree = this.el['files-tree'];
+    tree.innerHTML = '';
+
+    var container = tree;
+    for (var i = 0; i < parts.length; i++) {
+      var node = this.makeNode(parts[i].name, parts[i].path, i, i === parts.length - 1);
+      container.appendChild(node.wrap);
+      if (i < parts.length - 1) {
+        // 祖先一律先展开：打开面板就该看见"我在 home 里"，而不是一层层点开。
+        node.row.classList.add('open');
+        node.kids.hidden = false;
+        node.loaded = true;
+        this.loadNodeChildren(node);
+        container = node.kids;
+      }
+    }
+    this.markTree(home);
+  };
+
+  FilesPanel.prototype.makeNode = function (name, p, depth, isHome) {
+    var wrap = el('div', 'twrap');
+    var row = el('div', 'tnode is-dir');
+    row.dataset.path = p;
+    row.style.paddingLeft = (6 + depth * 12) + 'px';
+    row.innerHTML = '<span class="ttwist">▸</span>' +
+      '<span class="tico">' + ICO_DIR + '</span>' +
+      '<span class="tname"></span>';
+    row.querySelector('.tname').textContent = name;
+
+    var kids = el('div', 'tkids');
+    kids.hidden = true;
+
+    wrap.appendChild(row);
+    wrap.appendChild(kids);
+
+    var node = { wrap: wrap, row: row, kids: kids, loaded: false, loading: false, depth: depth };
+    row.__node = node;
+    if (isHome) row.title = p;
+    return node;
+  };
+
+  FilesPanel.prototype.loadNodeChildren = function (node) {
+    var self = this;
+    if (node.loading || node.loaded) return;
+    node.loading = true;
+
+    fetch(API + 'files/list?conn=' + encPath(this.conn) +
+      '&path=' + encPath(node.row.dataset.path), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        node.loading = false;
+        node.loaded = true;
+        node.kids.innerHTML = '';
+        if (!j || !j.ok) {
+          var w = el('div', 'files-hint warn');
+          w.textContent = (j && j.error) || '读不到';
+          node.kids.appendChild(w);
+          return;
+        }
+        var dirs = (j.data.items || []).filter(function (it) { return it.dir; });
+        if (!dirs.length) {
+          node.row.classList.add('leaf');
+          return;
+        }
+        for (var i = 0; i < dirs.length; i++) {
+          var child = self.makeNode(dirs[i].name, dirs[i].path, node.depth + 1, false);
+          node.kids.appendChild(child.wrap);
+        }
+      })
+      .catch(function () {
+        node.loading = false;
+        node.loaded = true;
+      });
+  };
+
+  FilesPanel.prototype.toggleNode = function (node, force) {
+    if (node.row.classList.contains('leaf') && force !== true) return;
+    var open = force === undefined ? !node.row.classList.contains('open') : force;
+    node.row.classList.toggle('open', open);
+    node.kids.hidden = !open;
+    if (open) this.loadNodeChildren(node);
+  };
+
+  // markTree 把当前目录在树上点亮，并保证那条链是展开的。
+  //
+  // 只在路径完全匹配时点：目录树和列表可能因为符号链接而不是同一个字符串，
+  // 那种情况下宁可不点，也不要把用户看到的两个位置搞得对不上。
+  FilesPanel.prototype.markTree = function (p) {
+    var rows = this.el['files-tree'].querySelectorAll('.tnode');
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var hit = row.dataset.path === p;
+      row.classList.toggle('active', hit);
+      if (hit) {
+        var node = row.__node;
+        if (node && node.depth > 0) {
+          // 点亮的同时展开它自己，这样下一层能直接看到
+          this.toggleNode(node, true);
+        }
+        if (row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  };
+
+  // ------------------------------------------------------------ 跟随终端
+
+  // startFollow 每 1.5 秒问一次"当前窗格的 shell 在哪个目录"。
+  //
+  // 为什么不用事件：用户在终端里敲 cd，shell 自己 chdir，服务端完全不知情。
+  // 唯一的事实来源是那个进程的 cwd，只能轮询。
+  //
+  // 只对本机跟随。远程 SFTP 连接是另一台机器，跟着本机终端跳没有意义。
+  FilesPanel.prototype.startFollow = function () {
+    var self = this;
+    if (this.cwdTimer) clearInterval(this.cwdTimer);
+    this.cwdTimer = setInterval(function () { self.pollCwd(); }, 1500);
+  };
+
+  FilesPanel.prototype.pollCwd = function () {
+    var self = this;
+    if (!this.open || this.conn !== 'local') return;
+
+    var pane = this.app.activePane();
+    var sid = pane && pane.sid;
+    if (!sid) return;
+
+    // 换了窗格/标签就重新对齐，否则会一直被上一格的目录原地按住。
+    if (sid !== this.lastSid) {
+      this.lastSid = sid;
+      this.lastCwd = '';
+    }
+
+    fetch(API + 'files/cwd?sid=' + encPath(sid), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var cwd = j && j.ok && j.data && j.data.cwd;
+        if (!cwd) return;
+        if (cwd === self.lastCwd) return;   // 没变
+        self.lastCwd = cwd;
+        if (cwd === self.path) return;      // 用户已经在这个目录里
+        self.go(cwd);
+      })
+      .catch(function () { /* 拿不到就当没这回事，面板待在原地 */ });
+  };
+
+  // ------------------------------------------------------------ 操作
+
+  FilesPanel.prototype.download = function (it) {
+    var a = document.createElement('a');
+    a.href = API + 'files/file?conn=' + encPath(this.conn) + '&path=' + encPath(it.path);
+    a.download = it.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    banner('正在下载 ' + it.name, 'info');
+  };
+
+  FilesPanel.prototype.post = function (api, body) {
+    return fetch(API + 'files/' + api, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return { ok: false, error: '服务端返回异常' }; });
+    }).then(function (j) {
+      if (!j || !j.ok) throw new Error((j && j.error) || '操作失败');
+      return j.data;
+    });
+  };
+
+  FilesPanel.prototype.setProgress = function (ratio) {
+    var bar = this.el['files-progress'];
+    if (ratio < 0) {
+      bar.hidden = true;
+      bar.firstElementChild.style.width = '0%';
+      return;
+    }
+    bar.hidden = false;
+    bar.firstElementChild.style.width = Math.round(ratio * 100) + '%';
+  };
+
+  FilesPanel.prototype.uploadOne = function (file, dir) {
+    var self = this;
+    var target = joinPath(dir, file.name);
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('PUT', API + 'files/file?conn=' + encPath(self.conn) +
+        '&path=' + encPath(target));
+      xhr.upload.onprogress = function (ev) {
+        if (ev.lengthComputable) self.setProgress(ev.loaded / ev.total);
+      };
+      xhr.onload = function () {
+        if (xhr.status === 200) { resolve(); return; }
+        var msg = '上传失败（' + xhr.status + '）';
+        try {
+          var j = JSON.parse(xhr.responseText);
+          if (j && j.error) msg = j.error;
+        } catch (e) { /* 非 JSON 响应，用状态码 */ }
+        reject(new Error(msg));
+      };
+      xhr.onerror = function () { reject(new Error('网络中断')); };
+      xhr.send(file);
+    });
+  };
+
+  // upload 一串文件，一个接一个。
+  //
+  // 并发上传看起来更快，但侧栏是挂在局域网里的：同时开五个 XMLHttpRequest
+  // 只会互相抢带宽，而且进度条没法表达"谁传到哪了"。串行反而干脆。
+  FilesPanel.prototype.upload = function (files, dir) {
+    var self = this;
+    var queue = files.slice(0);
+    var ok = 0, bad = 0;
+
+    var next = function () {
+      if (!queue.length) {
+        self.setProgress(-1);
+        if (bad) banner('上传结束：成功 ' + ok + ' 个，失败 ' + bad + ' 个', 'warn');
+        else banner('已上传 ' + ok + ' 个文件', 'ok');
+        if (self.path) self.go(self.path, { force: true });
+        return;
+      }
+      var f = queue.shift();
+      self.setProgress(0);
+      self.uploadOne(f, dir).then(function () {
+        ok++;
+        next();
+      }, function (err) {
+        bad++;
+        banner(f.name + '：' + (err.message || '上传失败'), 'warn');
+        next();
+      });
+    };
+    next();
+  };
+
+  // inlineName 在列表第一行插入一个输入框。
+  //
+  // 用内联而不是弹窗：新建文件夹、改名都是"就地改一行字"的动作，弹一个
+  // 居中对话框反而要用户把视线挪两次。回车确认、Esc 取消、点到别处算确认
+  // （和 Windows 资源管理器一致）。
+  FilesPanel.prototype.inlineName = function (placeholder, initial, done) {
+    var list = this.el['files-list'];
+    var hint = list.querySelector('.files-hint');
+    if (hint) hint.remove();
+
+    var row = el('div', 'frow editing');
+    row.innerHTML = '<span class="fico">' + ICO_DIR + '</span>';
+    var input = el('input', 'fname-input');
+    input.type = 'text';
+    input.value = initial || '';
+    input.placeholder = placeholder;
+    input.spellcheck = false;
+    row.appendChild(input);
+    list.insertBefore(row, list.firstChild);
+    input.focus();
+    input.select();
+
+    var finished = false;
+    var finish = function (accept) {
+      if (finished) return;
+      finished = true;
+      var v = input.value.trim();
+      row.remove();
+      done(accept && v ? v : null);
+    };
+
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+      // 空格、退格这些不能漏到终端快捷键上，但 app 的全局处理只在
+      // Ctrl+Alt 组合时才动手，所以这里不需要额外拦截。
+    });
+    input.addEventListener('blur', function () { finish(true); });
+  };
+
+  FilesPanel.prototype.mkdir = function () {
+    var self = this;
+    this.inlineName('新文件夹的名字', '', function (name) {
+      if (!name) return;
+      self.post('mkdir', { conn: self.conn, path: joinPath(self.path, name) })
+        .then(function () {
+          banner('已新建 ' + name, 'ok');
+          self.go(self.path, { force: true });
+        })
+        .catch(function (err) { banner(err.message, 'warn'); });
+    });
+  };
+
+  FilesPanel.prototype.rename = function (it) {
+    var self = this;
+    if (!it) return;
+    this.inlineName('新名字', it.name, function (name) {
+      if (!name || name === it.name) return;
+      self.post('rename', {
+        conn: self.conn,
+        from: it.path,
+        to: joinPath(self.path, name)
+      }).then(function () {
+        banner('已改名为 ' + name, 'ok');
+        self.go(self.path, { force: true });
+      }).catch(function (err) { banner(err.message, 'warn'); });
+    });
+  };
+
+  FilesPanel.prototype.remove = function (it) {
+    var self = this;
+    if (!it) return;
+    var what = it.dir
+      ? '文件夹「' + it.name + '」和里面的全部内容'
+      : '文件「' + it.name + '」';
+    this.app.ask('删除' + what + '？', '删掉之后找不回来。', '删除', function () {
+      self.post('remove', {
+        conn: self.conn,
+        path: it.path,
+        // 目录一律走递归删除：这里已经问过"和里面的全部内容"了，
+        // 再让用户为"目录非空"多点一次确认纯属折腾。
+        recursive: !!it.dir
+      }).then(function () {
+        banner('已删除 ' + it.name, 'ok');
+        self.go(self.path, { force: true });
+      }).catch(function (err) { banner(err.message, 'warn'); });
+    });
+  };
+
+  FilesPanel.prototype.copyPath = function (it) {
+    var p = it ? it.path : this.path;
+    var pane = this.app.activePane();
+    if (pane && pane.session && pane.session.copyText) {
+      pane.session.copyText(p, false);
+      return;
+    }
+    banner('已复制路径', 'ok');
+  };
+
+  // ------------------------------------------------------------ 右键菜单
+
+  FilesPanel.prototype.showMenu = function (x, y, it) {
+    var self = this;
+    var m = this.el['files-menu'];
+    m.innerHTML = '';
+
+    var add = function (label, fn, cls) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.addEventListener('click', function () {
+        m.hidden = true;
+        fn();
+      });
+      m.appendChild(b);
+    };
+    var sep = function () {
+      var d = el('div', 'sep');
+      m.appendChild(d);
+    };
+
+    if (it) {
+      add(it.dir ? '进入' : '打开', function () { self.openItem(it); });
+      if (!it.dir) {
+        add('下载', function () { self.download(it); });
+      }
+      sep();
+      add('重命名', function () { self.rename(it); });
+      add('复制路径', function () { self.copyPath(it); });
+      sep();
+      add('删除', function () { self.remove(it); }, 'danger');
+    } else {
+      add('新建文件夹', function () { self.mkdir(); });
+      add('上传文件…', function () { self.uploadInput.click(); });
+      sep();
+      add('刷新', function () { if (self.path) self.go(self.path, { force: true }); });
+    }
+
+    m.hidden = false;
+    var box = m.getBoundingClientRect();
+    if (x + box.width > window.innerWidth - 8) x = window.innerWidth - box.width - 8;
+    if (y + box.height > window.innerHeight - 8) y = window.innerHeight - box.height - 8;
+    m.style.left = Math.max(4, x) + 'px';
+    m.style.top = Math.max(4, y) + 'px';
+  };
+
+  // ------------------------------------------------------- 连接管理对话框
+
+  FilesPanel.prototype.openConns = function () {
+    var self = this;
+    this.el.conns.hidden = false;
+    this.loadConns().then(function () {
+      self.renderConnList();
+      if (self.conn !== 'local') {
+        var c = self.findConn(self.conn);
+        self.fillConnForm(c);
+        self.renderConnList();
+      } else if (self.connEditing) {
+        self.fillConnForm(self.findConn(self.connEditing));
+        self.renderConnList();
+      } else {
+        self.clearConnForm();
+      }
+    });
+  };
+
+  FilesPanel.prototype.closeConns = function () {
+    this.el.conns.hidden = true;
+    this.setConnTip('', '');
+  };
+
+  FilesPanel.prototype.setConnTip = function (text, cls) {
+    var t = this.el['cs-tip'];
+    t.textContent = text || '';
+    t.className = cls || '';
+  };
+
+  FilesPanel.prototype.renderConnList = function () {
+    var self = this;
+    var box = this.el['cs-list'];
+    box.innerHTML = '';
+
+    if (!this.conns.length) {
+      var empty = el('div');
+      empty.id = 'cs-empty';
+      empty.textContent = '还没有远程连接。右边填好主机和账号，点「保存」，' +
+        '它就会出现在这里，也会出现在侧栏顶部的来源下拉里。';
+      box.appendChild(empty);
+      return;
+    }
+
+    this.conns.forEach(function (c) {
+      var row = el('div', 'cs-item');
+      row.dataset.id = c.id;
+      if (self.connEditing === c.id) row.classList.add('active');
+
+      var name = el('span', 'cs-name');
+      name.textContent = c.name || (c.user + '@' + c.host);
+      row.appendChild(name);
+
+      var host = el('span', 'cs-host');
+      host.textContent = c.host;
+      row.appendChild(host);
+
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'cs-del';
+      del.textContent = '✕';
+      del.title = '删除这条连接';
+      del.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        self.deleteConn(c);
+      });
+      row.appendChild(del);
+
+      row.addEventListener('click', function () {
+        self.fillConnForm(c);
+        self.renderConnList();
+      });
+
+      box.appendChild(row);
+    });
+  };
+
+  FilesPanel.prototype.syncAuthRows = function () {
+    var key = this.el['cs-auth'].value === 'key';
+    this.el['cs-pw-row'].hidden = key;
+    this.el['cs-key-row'].hidden = !key;
+    this.el['cs-pass-row'].hidden = !key;
+  };
+
+  FilesPanel.prototype.fillConnForm = function (c) {
+    var e = this.el;
+    this.connEditing = c ? c.id : null;
+    e['cs-name'].value = c ? (c.name || '') : '';
+    e['cs-host'].value = c ? (c.host || '') : '';
+    e['cs-port'].value = c ? (c.port || 22) : 22;
+    e['cs-user'].value = c ? (c.user || '') : '';
+    e['cs-auth'].value = c ? (c.auth || 'password') : 'password';
+
+    // 密码永远不回填：服务端只告诉前端"存过没有"。留空即不修改，
+    // 这样"改个名字"不会顺手把密码抹掉。
+    e['cs-password'].value = '';
+    e['cs-password'].placeholder = (c && c.hasPassword)
+      ? '已保存，留空表示不修改' : '登录密码';
+    e['cs-keypath'].value = c ? (c.keyPath || '') : '';
+    e['cs-passphrase'].value = '';
+    e['cs-passphrase'].placeholder = (c && c.hasPassword && c.auth === 'key')
+      ? '已保存，留空表示不修改' : '没有就留空';
+
+    this.syncAuthRows();
+    this.setConnTip('', '');
+  };
+
+  FilesPanel.prototype.clearConnForm = function () {
+    this.fillConnForm(null);
+  };
+
+  FilesPanel.prototype.readConnForm = function () {
+    var e = this.el;
+    var body = {
+      id: this.connEditing || '',
+      name: e['cs-name'].value.trim(),
+      host: e['cs-host'].value.trim(),
+      port: parseInt(e['cs-port'].value, 10) || 22,
+      user: e['cs-user'].value.trim(),
+      auth: e['cs-auth'].value,
+      keyPath: e['cs-keypath'].value.trim()
+    };
+    // 只在真填了东西时才带密码：空串会被后端当成"把密码改成空"。
+    var pw = e['cs-password'].value;
+    var pp = e['cs-passphrase'].value;
+    if (pw) body.password = pw;
+    if (pp) body.passphrase = pp;
+    return body;
+  };
+
+  FilesPanel.prototype.saveConn = function () {
+    var self = this;
+    var body = this.readConnForm();
+    if (!body.host) { this.setConnTip('主机地址不能为空', 'err'); return; }
+    if (!body.user) { this.setConnTip('用户名不能为空', 'err'); return; }
+    if (body.auth === 'key' && !body.keyPath) {
+      this.setConnTip('私钥路径不能为空（填那台机器上私钥文件的绝对路径）', 'err');
+      return;
+    }
+
+    this.setConnTip('正在保存…', '');
+    fetch(API + 'files/conns', {
+      method: body.id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json();
+    }).then(function (j) {
+      if (!j || !j.ok) throw new Error((j && j.error) || '保存失败');
+      var saved = j.data;
+      self.connEditing = saved.id;
+      return self.loadConns().then(function () {
+        self.renderConnList();
+        self.renderConnSelect();
+        self.setConnTip('已保存，可以从顶部下拉里选它了', 'ok');
+      });
+    }).catch(function (err) {
+      self.setConnTip(err.message, 'err');
+    });
+  };
+
+  FilesPanel.prototype.deleteConn = function (c) {
+    var self = this;
+    this.app.ask('删除连接「' + (c.name || c.host) + '」？',
+      '只是从列表里去掉，不会动那台机器上的任何东西。', '删除', function () {
+        fetch(API + 'files/conns?id=' + encPath(c.id), { method: 'DELETE' })
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            if (!j || !j.ok) throw new Error((j && j.error) || '删除失败');
+            if (self.conn === c.id) self.useConn('local');
+            if (self.connEditing === c.id) self.clearConnForm();
+            return self.loadConns().then(function () {
+              self.renderConnList();
+              self.renderConnSelect();
+            });
+          })
+          .catch(function (err) { self.setConnTip(err.message, 'err'); });
+      });
+  };
+
+  FilesPanel.prototype.testConn = function () {
+    var self = this;
+    var body = this.readConnForm();
+    if (!body.host) { this.setConnTip('先填主机地址', 'err'); return; }
+    if (!body.user) { this.setConnTip('先填用户名', 'err'); return; }
+
+    this.setConnTip('正在连接…（最多等 12 秒）', '');
+    fetch(API + 'files/conns/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json();
+    }).then(function (j) {
+      if (!j || !j.ok) throw new Error((j && j.error) || '连不上');
+      var home = j.data && j.data.home;
+      self.setConnTip('连上了' + (home ? '，对方的 home 是 ' + home : ''), 'ok');
+    }).catch(function (err) {
+      self.setConnTip(err.message, 'err');
+    });
+  };
+
   // ------------------------------------------------------------- 启动
 
   var app = new Workspace();
+  // 文件侧栏挂在 Workspace 上：它要读设置、要在开关时让所有窗格重新 fit。
+  app.files = new FilesPanel(app);
 
   // 调试入口：控制台里 `__ts.webglCount()` 能看到当前有多少个窗格占着 WebGL
   // 上下文。分屏黑屏时先看这个数，超过上限就说明限流没生效。
@@ -4630,6 +5883,9 @@
     $('btn-split-col').addEventListener('click', function () { app.split('col'); });
 
     app.syncSettings();
+    // 侧栏要尽早挂上：它按本地缓存里的设置决定首屏要不要展开，服务端的
+    // 那份设置回来之后再校正一次。
+    app.files.init();
     app.save();
     // 服务端可能还有"没有页面挂着"的会话（页面崩过、上次点了只关界面）。
     // 启动时校正一次，把徽标点亮，否则用户以为那些进程不见了。

@@ -28,6 +28,19 @@ type Settings struct {
 	CursorBlink bool `json:"cursorBlink"`
 	// Scrollback 是每个窗格保留的回看行数，范围 1000..50000。
 	Scrollback int `json:"scrollback"`
+
+	// FilesOpen 表示左侧文件侧栏是否展开。
+	//
+	// 这个状态存在服务端而不是 localStorage：和布局、主题一样，换个浏览器
+	// 打开应该还是同一副样子。默认 false —— 首次安装打开页面时它是收起的，
+	// 不占地方；用户自己打开一次，之后就一直保持那个状态。
+	FilesOpen bool `json:"filesOpen"`
+	// FilesConn 是侧栏上次用的来源："local" 或某条远程连接 id。
+	FilesConn string `json:"filesConn"`
+	// FilesWidth 是侧栏宽度（像素）。
+	FilesWidth int `json:"filesWidth"`
+	// FilesTreeH 是侧栏里目录树占的高度（百分比），剩下的是文件列表。
+	FilesTreeH int `json:"filesTreeH"`
 }
 
 // 取值范围。设置页的输入框和这里的校验用同一套边界。
@@ -41,6 +54,13 @@ const (
 	DefaultFontSize = 14
 	// DefaultScrollback 和 xterm 的默认值对齐（10000 行，约 4MB 内存/窗格）。
 	DefaultScrollback = 10000
+	// 侧栏宽度的取值范围。上限放到 1200：4K 屏上 300px 的栏太窄，
+	// 但再宽就不叫侧栏了，那是把窗口分了一半出去。
+	FilesWidthMin = 200
+	FilesWidthMax = 1200
+	// 目录树占比，剩下的是文件列表。
+	FilesTreeMin = 15
+	FilesTreeMax = 85
 )
 
 // Default 返回一份默认设置。
@@ -51,6 +71,10 @@ func Default() Settings {
 		WebGL:          true,
 		CursorBlink:    true,
 		Scrollback:     DefaultScrollback,
+		FilesOpen:      false,
+		FilesConn:      "local",
+		FilesWidth:     300,
+		FilesTreeH:     40,
 	}
 }
 
@@ -68,6 +92,15 @@ func (s Settings) Normalize() Settings {
 	}
 	if s.Scrollback < ScrollbackMin || s.Scrollback > ScrollbackMax {
 		s.Scrollback = d.Scrollback
+	}
+	if s.FilesWidth < FilesWidthMin || s.FilesWidth > FilesWidthMax {
+		s.FilesWidth = d.FilesWidth
+	}
+	if s.FilesTreeH < FilesTreeMin || s.FilesTreeH > FilesTreeMax {
+		s.FilesTreeH = d.FilesTreeH
+	}
+	if s.FilesConn == "" {
+		s.FilesConn = d.FilesConn
 	}
 	return s
 }
@@ -92,6 +125,14 @@ func (s Settings) patch(raw map[string]json.RawMessage) (Settings, error) {
 			err = json.Unmarshal(v, &out.CursorBlink)
 		case "scrollback":
 			err = json.Unmarshal(v, &out.Scrollback)
+		case "filesOpen":
+			err = json.Unmarshal(v, &out.FilesOpen)
+		case "filesConn":
+			err = json.Unmarshal(v, &out.FilesConn)
+		case "filesWidth":
+			err = json.Unmarshal(v, &out.FilesWidth)
+		case "filesTreeH":
+			err = json.Unmarshal(v, &out.FilesTreeH)
 		default:
 			continue // 未知字段不报错
 		}
@@ -107,6 +148,18 @@ func (s Settings) patch(raw map[string]json.RawMessage) (Settings, error) {
 	}
 	if out.Scrollback < ScrollbackMin || out.Scrollback > ScrollbackMax {
 		return s, fmt.Errorf("scrollback 必须在 %d..%d 之间", ScrollbackMin, ScrollbackMax)
+	}
+	if out.FilesWidth < FilesWidthMin || out.FilesWidth > FilesWidthMax {
+		return s, fmt.Errorf("filesWidth 必须在 %d..%d 之间", FilesWidthMin, FilesWidthMax)
+	}
+	if out.FilesTreeH < FilesTreeMin || out.FilesTreeH > FilesTreeMax {
+		return s, fmt.Errorf("filesTreeH 必须在 %d..%d 之间", FilesTreeMin, FilesTreeMax)
+	}
+	if len(out.FilesConn) > 64 {
+		return s, fmt.Errorf("filesConn 太长")
+	}
+	if out.FilesConn == "" {
+		out.FilesConn = Default().FilesConn
 	}
 	return out, nil
 }

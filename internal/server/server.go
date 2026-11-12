@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"terminals/internal/config"
+	"terminals/internal/files"
 	"terminals/internal/history"
 	"terminals/internal/session"
 	"terminals/ui"
@@ -34,6 +35,8 @@ type Options struct {
 	Settings *config.Store
 	// History 是会话历史仓库。nil 表示不记录 / 不提供历史面板。
 	History *history.Store
+	// Files 是文件侧栏的后端（本机 + 远程 SFTP）。nil 表示不提供。
+	Files *files.Service
 }
 
 // Server 组装路由与中间件。
@@ -72,6 +75,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/settings", s.handleSettings)
 	s.mux.HandleFunc("/api/history", s.handleHistory)
 	s.mux.HandleFunc("/api/history/", s.handleHistoryByID)
+	s.mux.HandleFunc("/api/files/", s.handleFiles)
 
 	// 静态资源：http.FileServerFS 自带路径穿越防护（会拒绝 ..），
 	// 不需要自己拼路径。

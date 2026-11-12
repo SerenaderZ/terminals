@@ -13,14 +13,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"terminals/internal/config"
 	"terminals/internal/diag"
+	"terminals/internal/files"
 	"terminals/internal/history"
 	"terminals/internal/server"
 	"terminals/internal/session"
@@ -194,6 +197,19 @@ func main() {
 	}()
 
 	layoutStore := server.NewLayoutStore(layoutFile)
+
+	// 文件面板。
+	//
+	// 本机视图走的是"终端里那个账户"的身份：tsd 以 root 起，shell 却降权到
+	// 管理员，如果面板以 root 写盘，传上去的文件属主就是 root —— 终端里的
+	// 用户反而改不动自己刚传的东西。远程连接清单放在数据目录，密码加密。
+	filesStore, ferr := files.NewStore(dir)
+	if ferr != nil {
+		log.Printf("远程连接清单不可用：%v（文件面板只提供本机）", ferr)
+		filesStore = nil
+	}
+	fileSvc := files.NewService(files.NewLocal(fileCredential(cfg), cfg.RunAsHome), filesStore)
+
 	log.Printf("数据目录：%s", dir)
 	log.Printf("布局文件：%s", layoutFile)
 	log.Printf("设置文件：%s", filepath.Join(dir, "settings.json"))
@@ -206,6 +222,7 @@ func main() {
 		Layout:       layoutStore,
 		Settings:     settingsStore,
 		History:      hist,
+		Files:        fileSvc,
 	})
 
 	httpSrv := &http.Server{
@@ -255,6 +272,7 @@ func main() {
 	if hist != nil {
 		hist.Close()
 	}
+	fileSvc.Close()
 
 	if *socketPath != "" {
 		_ = os.Remove(*socketPath)
@@ -270,6 +288,34 @@ func isFlagPassed(name string) bool {
 		}
 	})
 	return found
+}
+
+// fileCredential 算出文件面板该用哪个身份。
+//
+// 三条判断，缺一不可：
+//   - 非 root 进程：本来就是这个身份，没什么可切的；
+//   - --run-as root（或没配）：终端也是 root，文件跟着 root；
+//   - 查不到这个账户：退回进程身份，让面板至少能用。
+//
+// 只在 Linux 上真的会切换（见 internal/files/cred_linux.go）。
+func fileCredential(cfg session.Config) files.Credential {
+	if runtime.GOOS == "windows" || os.Geteuid() != 0 {
+		return files.None()
+	}
+	if cfg.RunAs == "" || cfg.RunAs == "root" {
+		return files.None()
+	}
+	u, err := user.Lookup(cfg.RunAs)
+	if err != nil {
+		log.Printf("文件面板：查不到账户 %s，将按当前身份访问文件", cfg.RunAs)
+		return files.None()
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil {
+		return files.None()
+	}
+	return files.Credential{UID: uid, GID: gid}
 }
 
 // resolveDataDir 决定布局文件与会话清单落在哪里。
