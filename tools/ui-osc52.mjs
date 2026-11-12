@@ -153,6 +153,8 @@ process.on('exit', cleanup);
   }
 
   // ---------- 2. 程序自己发 OSC 52 ----------
+  // 先等过"拖选回声"窗口：这一段测的是与拖选无关的程序复制。
+  await sleep(2200);
   await send(`node ${GEN_OSC}\r`);
   await sleep(1800);
   const osc = await copied();
@@ -185,9 +187,11 @@ process.on('exit', cleanup);
   const na = await page.evaluate(() => (window.__copied || []).length);
   check('回放历史里的 OSC 52 不写剪贴板', na === nb, `${nb} → ${na}`);
 
-  // ---------- 5. 用户框的范围优先于程序随后发来的 OSC 52 ----------
-  // Claude Code 在 mouseup 之后才发序列，而且只带它渲染的那 3 行文字，
-  // 用户框进去的上下空行不在里面。这条序列不能把用户的高亮框盖掉。
+  // ---------- 5. 拖选之后程序的"回放"必须被吞掉 ----------
+  // 程序收到鼠标报告就会自己发一条 OSC 52，内容只含它渲染的那 3 行文字，
+  // 用户框进去的上下空行不在里面。这条序列是程序在回放这次拖选，
+  // **不能写剪贴板**：写了就等于拖选变静默自动复制，而且它可能正好落在
+  // 用户"再点一下想取消"的按下与松开之间，屏幕上就冒出一条"复制成功"。
   await page.evaluate(() => window.__ts.app.newTab(true));
   await sleep(1500);
   await send(`node ${GEN_LINES}\r`);
@@ -195,28 +199,91 @@ process.on('exit', cleanup);
   const r5 = await findRow('L1-COPY');
   check('新标签里三行内容在屏幕上', r5 >= 0, `row=${r5}`);
   if (r5 >= 0) {
+    // 先放一个可辨认的基线，用来区分"剪贴板没动"和"写了别的东西"。
+    const mid5 = await page.evaluate(() => {
+      const box = window.__ts.app.activePane().host.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    });
+    await page.evaluate(() => window.__ts.app.activePane().session.copyText('BASELINE'));
+    const beforeEcho = await page.evaluate(() => (window.__copied || []).length);
+
     await dragRows(r5, r5 + 4);
     const picked = await plain();
     check('用户框了 5 行', picked.split('\n').length === 5, JSON.stringify(picked));
+    // banner 里可能还挂着上一条消息，只能比"这条回放前后有没有变"。
+    const recBefore = await page.evaluate(() => document.getElementById('banner').textContent);
+
     const short = 'L1-COPY\nL2-COPY\nL3-COPY';   // 程序只交出 3 行
     await page.evaluate((p) => {
       window.__ts.app.activePane().session.term.write('\x1b]52;c;' + p + '\x07');
     }, Buffer.from(short, 'utf8').toString('base64'));
     await sleep(400);
-    const final = await copied();
-    check('程序只发 3 行时，剪贴板仍是用户框的 5 行',
-      final === picked, JSON.stringify(final));
+    const afterEcho = await page.evaluate(() => (window.__copied || []).length);
+    check('拖选后的 OSC 52 回放不写剪贴板',
+      afterEcho === beforeEcho, `${beforeEcho} → ${afterEcho}`);
     const rec5 = await page.evaluate(() => document.getElementById('banner').textContent);
-    check('回执写明"按你框选的"', /按你框选的/.test(rec5), JSON.stringify(rec5));
+    check('拖选后不弹"已写入剪贴板"回执',
+      rec5 === recBefore, JSON.stringify(rec5));
+    check('拖选之外的东西没被写进剪贴板（还是基线）',
+      (await copied()) === 'BASELINE', JSON.stringify(await copied()));
+
+    // 真正拿走内容仍然只有一条路：右键（有选区 → 复制）。
+    await page.mouse.click(mid5.x, mid5.y, { button: 'right' });
+    await sleep(500);
+    check('右键复制拿到的仍是用户框的 5 行',
+      (await copied()) === picked, JSON.stringify(await copied()));
   }
 
-  // ---------- 6. 用户复制完之后，程序发起的复制照常生效 ----------
-  // 右键复制会结束这次交互，不能拿旧框去盖掉后面的程序复制。
+  // ---------- 6. 回声窗口过去之后，程序发起的复制照常生效 ----------
+  // 拖选只是拖选；过了这个窗口，vim / tmux / ssh 插件的主动复制不能被误吞。
   await page.evaluate(() => window.__ts.app.activePane().session.clearSelection());
+  await sleep(2200);
   await send(`node ${GEN_OSC}\r`);
   await sleep(1600);
   const osc6 = await copied();
-  check('选区结束后 OSC 52 不被旧框覆盖', osc6 === 'OSC-AAA\nOSC-中文', JSON.stringify(osc6));
+  check('回声窗口之后 OSC 52 照常生效', osc6 === 'OSC-AAA\nOSC-中文', JSON.stringify(osc6));
+
+  // ---------- 7. "拖选 → 再点一下想取消"不能变成偷偷复制 ----------
+  // 这条按用户的实际操作走：框住 5 行，然后按下左键想取消。程序是先收到
+  // 按下才发现鼠标还在自己那块区域，回放的 OSC 52 可能就落在按下与松开
+  // 之间。此时剪贴板必须原样不动，屏幕上也不能冒出"复制成功"。
+  await page.evaluate(() => window.__ts.app.newTab(true));
+  await sleep(1500);
+  await send(`node ${GEN_LINES}\r`);
+  await sleep(2200);
+  const r7 = await findRow('L1-COPY');
+  check('取消用例：三行内容在屏幕上', r7 >= 0, `row=${r7}`);
+  if (r7 >= 0) {
+    const mid7 = await page.evaluate(() => {
+      const box = window.__ts.app.activePane().host.getBoundingClientRect();
+      return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    });
+    await page.evaluate(() => window.__ts.app.activePane().session.copyText('BASELINE-2'));
+    await dragRows(r7, r7 + 4);
+    const cnt = await page.evaluate(() => (window.__copied || []).length);
+    const recBefore = await page.evaluate(() => document.getElementById('banner').textContent);
+
+    // 按下左键（本意是取消），回放在这一刻到达
+    await page.mouse.move(mid7.x, mid7.y);
+    await page.mouse.down();
+    await page.evaluate((p) => {
+      window.__ts.app.activePane().session.term.write('\x1b]52;c;' + p + '\x07');
+    }, Buffer.from('L1-COPY\nL2-COPY\nL3-COPY', 'utf8').toString('base64'));
+    await sleep(150);
+    await page.mouse.up();
+    await sleep(400);
+
+    const cntAfter = await page.evaluate(() => (window.__copied || []).length);
+    check('取消后剪贴板没有被写', cntAfter === cnt, `${cnt} → ${cntAfter}`);
+    const sel7 = await page.evaluate(() => {
+      const s = window.__ts.app.activePane().session;
+      return { range: !!s.selRange, snap: !!s.selSnap };
+    });
+    check('取消后选区已清空', sel7.range === false && sel7.snap === false, JSON.stringify(sel7));
+    const rec7 = await page.evaluate(() => document.getElementById('banner').textContent);
+    check('取消后不冒出新回执',
+      rec7 === recBefore, JSON.stringify(rec7));
+  }
 
   console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
   cleanup();

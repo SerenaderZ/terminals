@@ -165,6 +165,14 @@
   var innerClip = null;
   var INNER_CLIP_TTL = 120000;
 
+  // 拖选结束之后的这个窗口里，程序发来的 OSC 52 都当作"它在回放这次拖选"。
+  //
+  // 程序收到鼠标报告就知道你选了东西，会立刻发一条自己的复制序列；如果链路
+  // 稍慢（远程 SSH、手机热点），这条序列可能在你下一次按下鼠标时才到。窗口
+  // 给宽一点也无妨：真要让程序复制东西（vim 的 y、tmux 的插件），通常不会
+  // 卡在你松手后两秒内。
+  var DRAG_ECHO_MS = 2000;
+
   function rememberClip(text) {
     if (!text) return;
     innerClip = { text: text, at: Date.now() };
@@ -676,10 +684,12 @@
     //   selRange —— 选中范围（缓冲区绝对行号/列号，结束列不含）
     //   selDrag  —— 正在拖动时的锚点
     //   selSnap  —— 上一次选中的文本（复制不再回头问终端要）
+    //   lastDragAt —— 上一次拖选结束的时刻，用来吞掉程序的"回放"
     this.selEl = null;
     this.selRange = null;
     this.selDrag = null;
     this.selSnap = null;
+    this.lastDragAt = 0;
     this.selPaintRAF = 0;
     this.paintTimer = 0;
     this.widthTimer = 0;
@@ -1852,29 +1862,28 @@
         var text = base64Text(data);
         if (!text) return true;
 
-        // 用户自己框出来的范围优先于程序单方面发来的复制。
+        // 刚拖完这一小段时间里，程序发来的 OSC 52 一律当作它在回放这次拖选，
+        // 直接吞掉：不写剪贴板，也不提示。
         //
-        // 0.5.2 把 OSC 52 接通之后，"框 5 行粘出来 3 行"反而变稳定了：
-        // Claude Code 在 mouseup 后发的那条序列只带它画出来的 3 行文字，
-        // 而且总是比我们晚到，于是用户框进去的空行被它覆盖掉。屏幕上那
-        // 个拖得动、看得见的高亮框才是人真正要复制的范围，这里把它换回来。
+        // 这条序列是程序对"用户拖选"的自动反应，内容只含它渲染出的文字行
+        // （Claude Code 的欢迎块就是 3 行），用户框进去的上下空行不在里面。
+        // 更麻烦的是它可能落在你"再点一下想取消"的按下与松开之间 —— 程序先
+        // 收到按下就发了序列，我们才收到松开。所以这条路上任何"写剪贴板"
+        // 的动作都会让"取消"变成"偷偷复制了一次"。
         //
-        // 只在"刚拖完、且用户框的行数更多"时接管：没有框选或者框选早已
-        // 过期的场合（vim / tmux / ssh 里的 osc52 插件主动复制）照常生效；
-        // 程序给的比用户框的还完整时也不去动它。
-        var picked = self.lastPicked;
-        var fromUser = !!(picked && (Date.now() - picked.at) < 3000 &&
-          picked.text !== text &&
-          picked.text.split('\n').length > text.split('\n').length);
-        if (fromUser) text = picked.text;
+        // 于是规则回到最简单的一条：拖选只是拖选，只有右键（有选区）才会
+        // 把文字放进剪贴板。超过这个窗口的程序复制（vim / tmux / ssh 的
+        // osc52 插件主动复制）照常生效。
+        if (self.lastDragAt && (Date.now() - self.lastDragAt) < DRAG_ECHO_MS) {
+          return true;
+        }
 
         // 回执：程序那边只会说"我发出去了"，剪贴板里到底有没有、有多少，
-        // 只有终端自己知道。数字能拿去和程序那句 "sent N chars" 对账；
-        // 换了用户框的内容时也要说清楚，免得两边数字对不上又是一头雾水。
+        // 只有终端自己知道。数字能拿去和程序那句 "sent N chars" 对账。
         var ok = self.copyText(text, true);
         var size = text.split('\n').length + ' 行（' + text.length + ' 个字符）';
         banner(ok
-          ? (fromUser ? '按你框选的 ' : '程序发来的 ') + size + '已写入剪贴板'
+          ? '程序发来的 ' + size + '已写入剪贴板'
           : '浏览器拒绝写入剪贴板：' + size + '只留在了应用内（右键粘贴可用）',
           ok ? 'receipt' : 'warn');
         return true;
@@ -2258,15 +2267,18 @@
     var text = this.rangeText();
     if (!text) { this.clearSelection(); return; }
     this.selSnap = { text: text };
-    // 单独再留一份"用户刚刚框了什么"。
+    // 只记一个时刻，不再留一份文本。
     //
     // 全屏程序开着鼠标追踪时，我们照样记范围但不拦事件：Claude Code 收到
-    // 鼠标报告会自己画框、自己发一条 OSC 52，里面的内容只含它渲染出来的
-    // 文字行（欢迎块就是那 3 行），用户框进去的上下空行根本不在里面。
-    // 那条序列在 mouseup 之后才到，会把剪贴板刷成 3 行 —— 人框了 5 行、
-    // 粘出来 3 行，就是这么来的。紧接着的整屏重绘还可能把 selRange /
-    // selSnap 一起清掉，所以这份快照要独立于选区存活，只按时间过期。
-    this.lastPicked = { text: text, at: Date.now() };
+    // 鼠标报告会自己画框、自己发一条 OSC 52，内容只含它渲染出来的文字行
+    // （欢迎块就是那 3 行）。那条序列是程序在**回放这次拖选**，不是用户
+    // 要求的复制；它落在 mouseup 之后，甚至可能正好落在你"再点一下想取消"
+    // 的按下与松开之间（程序先收到按下、先发了序列，我们才收到松开）。
+    //
+    // 所以这个时刻的唯一用途是"吞掉回放"，见 installClipboardBridge。
+    // 以前这里存了文本、把回声换成用户框的内容再写剪贴板，等于让拖选变成
+    // 静默自动复制："拖一下 → 点一下想取消 → 却提示复制成功"，就是那么来的。
+    this.lastDragAt = Date.now();
     this.paintSelection();
   };
 
@@ -2383,9 +2395,10 @@
     this.selSnap = null;
     this.selRange = null;
     this.selDrag = null;
-    // 用户已经把框选的内容拿走（右键复制）或主动丢开（点空白、按了键），
-    // 这次交互就结束了。之后程序再发 OSC 52 要照常生效，别再拿旧框去盖。
-    this.lastPicked = null;
+    // 刻意不动 lastDragAt：取消之后程序那条回声可能还在路上（它是在你按下
+    // 左键时发出来的，比松开还早）。这里要是把时刻清掉，回声就成了"没有
+    // 框选、可以照常生效"，刚好在你点一下想取消的瞬间把剪贴板写掉 —— 取消
+    // 也就白点了。让它自己按时间过期，见 DRAG_ECHO_MS。
     // xterm 自己那份选区也清掉：虽然不用它，但留着会让浏览器原生复制
     // （Ctrl+C 在非终端焦点时）拿到不一致的内容。
     try { if (this.term) this.term.clearSelection(); } catch (e) { }
